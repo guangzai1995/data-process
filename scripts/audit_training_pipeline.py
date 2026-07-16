@@ -70,7 +70,6 @@ def iter_index_records(input_root, date):
                     stripped,
                     parse_constant=reject_json_constant,
                     parse_float=parse_finite_float,
-                    parse_int=parse_limited_int,
                 )
             except ValueError:
                 yield None, {"line": line_number, "reason": "bad_index_json"}
@@ -203,13 +202,6 @@ def parse_finite_float(value):
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError("non-finite JSON number")
-    return parsed
-
-
-def parse_limited_int(value):
-    parsed = int(value)
-    if parsed > MAX_USAGE_TOKENS:
-        raise ValueError("integer JSON number too large")
     return parsed
 
 
@@ -1129,7 +1121,6 @@ def load_audit_record(input_root, index_record):
                 handle,
                 parse_constant=reject_json_constant,
                 parse_float=parse_finite_float,
-                parse_int=parse_limited_int,
             ), None
     except ValueError:
         return None, {

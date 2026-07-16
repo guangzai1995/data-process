@@ -1568,6 +1568,27 @@ class PipelineRunTest(unittest.TestCase):
                 "",
             )
 
+    def test_process_date_accepts_large_non_usage_integers(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            detail = day / "u" / "s" / "001.json"
+            raw = sample_success_record()
+            raw["timestamp_ms"] = 1712345678901
+            write_json(detail, raw)
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(result["rejected"], 0)
+            canonical_lines = (output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(canonical_lines), 1)
+
     def test_process_date_rejects_overflow_float_detail_and_continues(self):
         pipeline = load_pipeline_module()
         with tempfile.TemporaryDirectory() as tmp:
