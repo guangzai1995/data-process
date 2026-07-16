@@ -420,12 +420,12 @@ def normalize_model_label(model_label):
 
 
 
-def safe_positive_int(value, default):
+def clamped_int(value, default, minimum, maximum):
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        return default
-    return parsed
+        parsed = default
+    return min(maximum, max(minimum, parsed))
 
 
 def load_label_config(env=None):
@@ -433,17 +433,17 @@ def load_label_config(env=None):
     base_url = source.get("AUDIT_LABEL_BASE_URL", "").rstrip("/")
     api_key = source.get("AUDIT_LABEL_API_KEY", "")
     model = source.get("AUDIT_LABEL_MODEL", "")
-    timeout = safe_positive_int(source.get("AUDIT_LABEL_TIMEOUT", "30"), 30)
-    max_concurrency = safe_positive_int(
-        source.get("AUDIT_LABEL_MAX_CONCURRENCY", "1"), 1
+    timeout = clamped_int(source.get("AUDIT_LABEL_TIMEOUT", "30"), 30, 1, 120)
+    max_concurrency = clamped_int(
+        source.get("AUDIT_LABEL_MAX_CONCURRENCY", "1"), 1, 1, 16
     )
     return {
         "enabled": bool(base_url and api_key and model),
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
-        "timeout": max(1, timeout),
-        "max_concurrency": max(1, max_concurrency),
+        "timeout": timeout,
+        "max_concurrency": max_concurrency,
     }
 
 
@@ -457,11 +457,32 @@ def parse_label_response(text):
     normalized = normalize_model_label(payload)
     if normalized is None:
         return None
+    reason = payload.get("reason", "")
+    if not isinstance(reason, str):
+        return None
     return {
         "label": normalized["label"],
         "confidence": normalized["confidence"],
-        "reason": str(payload.get("reason", "")),
+        "reason": reason,
     }
+
+
+def label_content_from_response(payload):
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    return content
 
 
 def call_label_model(router_record, config, urlopen=None):
@@ -504,12 +525,8 @@ def call_label_model(router_record, config, urlopen=None):
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return None, "labeler_request_failed:%s" % exc.__class__.__name__
-    try:
-        content = (
-            ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
-            or ""
-        )
-    except AttributeError:
+    content = label_content_from_response(payload)
+    if content is None:
         return None, "labeler_invalid_response"
     parsed = parse_label_response(content)
     if parsed is None:

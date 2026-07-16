@@ -856,12 +856,22 @@ class LabelModelTest(unittest.TestCase):
                 )
                 self.assertIsNone(pipeline.parse_label_response(text))
 
-    def test_parse_label_response_stringifies_reason(self):
+    def test_parse_label_response_rejects_non_string_reason(self):
+        pipeline = load_pipeline_module()
+        for reason in ({"why": "tools"}, ["tools"]):
+            with self.subTest(reason=reason):
+                text = json.dumps(
+                    {"label": "tool_agent", "confidence": 0.82, "reason": reason},
+                    ensure_ascii=False,
+                )
+                self.assertIsNone(pipeline.parse_label_response(text))
+
+    def test_parse_label_response_allows_missing_reason(self):
         pipeline = load_pipeline_module()
         parsed = pipeline.parse_label_response(
-            '{"label":"tool_agent","confidence":0.82,"reason":{"why":"tools"}}'
+            '{"label":"tool_agent","confidence":0.82}'
         )
-        self.assertEqual(parsed["reason"], "{'why': 'tools'}")
+        self.assertEqual(parsed["reason"], "")
 
     def test_label_config_reads_environment(self):
         pipeline = load_pipeline_module()
@@ -887,19 +897,38 @@ class LabelModelTest(unittest.TestCase):
         )
         self.assertFalse(config["enabled"])
 
-    def test_label_config_safely_defaults_invalid_numbers(self):
+    def test_label_config_clamps_and_defaults_numbers(self):
         pipeline = load_pipeline_module()
+        base_env = {
+            "AUDIT_LABEL_BASE_URL": "https://example.test/v1/",
+            "AUDIT_LABEL_API_KEY": "key",
+            "AUDIT_LABEL_MODEL": "label-model",
+        }
         config = pipeline.load_label_config(
-            {
-                "AUDIT_LABEL_BASE_URL": "https://example.test/v1/",
-                "AUDIT_LABEL_API_KEY": "key",
-                "AUDIT_LABEL_MODEL": "label-model",
-                "AUDIT_LABEL_TIMEOUT": "bad",
-                "AUDIT_LABEL_MAX_CONCURRENCY": "0",
-            }
+            dict(
+                base_env,
+                AUDIT_LABEL_TIMEOUT="999999",
+                AUDIT_LABEL_MAX_CONCURRENCY="999999",
+            )
         )
         self.assertTrue(config["enabled"])
         self.assertEqual(config["base_url"], "https://example.test/v1")
+        self.assertEqual(config["timeout"], 120)
+        self.assertEqual(config["max_concurrency"], 16)
+
+        config = pipeline.load_label_config(
+            dict(base_env, AUDIT_LABEL_TIMEOUT="-5", AUDIT_LABEL_MAX_CONCURRENCY="0")
+        )
+        self.assertEqual(config["timeout"], 1)
+        self.assertEqual(config["max_concurrency"], 1)
+
+        config = pipeline.load_label_config(
+            dict(
+                base_env,
+                AUDIT_LABEL_TIMEOUT="bad",
+                AUDIT_LABEL_MAX_CONCURRENCY="bad",
+            )
+        )
         self.assertEqual(config["timeout"], 30)
         self.assertEqual(config["max_concurrency"], 1)
 
@@ -911,6 +940,7 @@ class LabelModelTest(unittest.TestCase):
 
     def test_call_label_model_parses_successful_response(self):
         pipeline = load_pipeline_module()
+        router_record = {"input": "use a tool"}
         calls = []
 
         class FakeResponse(object):
@@ -935,6 +965,19 @@ class LabelModelTest(unittest.TestCase):
 
         def fake_urlopen(request, timeout=None):
             calls.append((request, timeout))
+            self.assertEqual(request.full_url, "https://example.test/v1/chat/completions")
+            self.assertEqual(request.get_header("Authorization"), "Bearer key")
+            self.assertEqual(request.get_header("Content-type"), "application/json")
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body["model"], "label-model")
+            self.assertEqual(body["temperature"], 0)
+            self.assertGreaterEqual(len(body["messages"]), 2)
+            self.assertEqual(body["messages"][0]["role"], "system")
+            self.assertEqual(body["messages"][1]["role"], "user")
+            prompt = json.loads(body["messages"][1]["content"])
+            self.assertEqual(prompt["task"], "classify_route")
+            self.assertIn("tool_agent", prompt["labels"])
+            self.assertEqual(prompt["sample"], router_record)
             return FakeResponse()
 
         config = {
@@ -945,13 +988,12 @@ class LabelModelTest(unittest.TestCase):
             "timeout": 12,
         }
         parsed, error = pipeline.call_label_model(
-            {"input": "use a tool"}, config, urlopen=fake_urlopen
+            router_record, config, urlopen=fake_urlopen
         )
         self.assertIsNone(error)
         self.assertEqual(parsed["label"], "tool_agent")
         self.assertEqual(parsed["confidence"], 0.91)
         self.assertEqual(calls[0][1], 12)
-        self.assertEqual(calls[0][0].full_url, "https://example.test/v1/chat/completions")
 
     def test_call_label_model_rejects_invalid_response(self):
         pipeline = load_pipeline_module()
@@ -989,6 +1031,51 @@ class LabelModelTest(unittest.TestCase):
         parsed, error = pipeline.call_label_model({}, config, urlopen=fake_urlopen)
         self.assertIsNone(parsed)
         self.assertEqual(error, "labeler_invalid_response")
+
+
+    def test_call_label_model_rejects_malformed_response_shapes(self):
+        pipeline = load_pipeline_module()
+        config = {
+            "enabled": True,
+            "base_url": "https://example.test/v1",
+            "api_key": "key",
+            "model": "label-model",
+            "timeout": 12,
+        }
+        malformed_payloads = [
+            [],
+            {"choices": {"unexpected": "shape"}},
+            {"choices": 1},
+            {"choices": "bad"},
+            {"choices": []},
+            {"choices": ["not-a-dict"]},
+            {"choices": [{"message": "not-a-dict"}]},
+            {"choices": [{"message": {"content": {"label": "tool_agent"}}}]},
+        ]
+
+        class FakeResponse(object):
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                def fake_urlopen(request, timeout=None, payload=payload):
+                    return FakeResponse(payload)
+
+                parsed, error = pipeline.call_label_model(
+                    {}, config, urlopen=fake_urlopen
+                )
+                self.assertIsNone(parsed)
+                self.assertEqual(error, "labeler_invalid_response")
 
 
 if __name__ == "__main__":
