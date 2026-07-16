@@ -197,5 +197,149 @@ class CanonicalBuildTest(unittest.TestCase):
         self.assertEqual(reject["reason"], "empty_assistant_response")
 
 
+    def test_build_canonical_sample_filters_direct_identifier_params(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"].update(
+            {
+                "user": "request-body-user",
+                "tenant_id": "request-body-tenant",
+                "session_id": "request-body-session",
+                "api_key_id": "request-body-api-key",
+                "client_ip": "203.0.113.9",
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "max_tokens": 128,
+            }
+        )
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        dumped = json.dumps(canonical, ensure_ascii=False)
+        self.assertNotIn("request-body-user", dumped)
+        self.assertNotIn("request-body-tenant", dumped)
+        self.assertNotIn("request-body-session", dumped)
+        self.assertNotIn("request-body-api-key", dumped)
+        self.assertNotIn("203.0.113.9", dumped)
+        self.assertEqual(canonical["request"]["params"]["temperature"], 0.7)
+        self.assertEqual(canonical["request"]["params"]["top_p"], 0.8)
+        self.assertEqual(canonical["request"]["params"]["max_tokens"], 128)
+        self.assertEqual(canonical["request"]["params"]["client_type"], "opencode")
+        self.assertEqual(canonical["request"]["params"]["is_stream"], False)
+
+    def test_build_canonical_sample_rejects_oversized_tool_call_response(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "x" * 64},
+                }
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+            max_response_chars=20,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "response_too_long")
+
+    def test_build_canonical_sample_accepts_multipart_assistant_text(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"][0]["message"]["content"] = [
+            {"type": "text", "text": "可以联系 13800138000"}
+        ]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        self.assertIn(
+            "<PHONE_1>",
+            canonical["response"]["message"]["content"][0]["text"],
+        )
+
+    def test_build_canonical_sample_rejects_non_list_choices(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"] = {"0": raw["response_body"]["choices"][0]}
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "missing_choices")
+
+    def test_build_canonical_sample_rejects_non_dict_request_body(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"] = "not a request object"
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "missing_messages")
+
+    def test_build_canonical_sample_hashes_are_deterministic(self):
+        pipeline = load_pipeline_module()
+        index = {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}
+        first, first_reject = pipeline.build_canonical_sample(
+            "2026-07-15", index, sample_success_record()
+        )
+        second, second_reject = pipeline.build_canonical_sample(
+            "2026-07-15", index, sample_success_record()
+        )
+        self.assertIsNone(first_reject)
+        self.assertIsNone(second_reject)
+        self.assertEqual(first["sample_id"], second["sample_id"])
+        self.assertEqual(
+            first["quality"]["content_hash"], second["quality"]["content_hash"]
+        )
+
+    def test_build_canonical_sample_marks_tool_use_task_type(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        self.assertIn("tool_use_sft", canonical["quality"]["task_types"])
+
+    def test_build_canonical_sample_rejects_long_prompt(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["messages"] = [{"role": "user", "content": "x" * 32}]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+            max_prompt_chars=10,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "prompt_too_long")
+
+
 if __name__ == "__main__":
     unittest.main()
