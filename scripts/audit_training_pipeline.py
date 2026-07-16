@@ -7,6 +7,8 @@ DEFAULT_OUTPUT_ROOT = "audit_training"
 
 
 import hashlib
+import json
+import pathlib
 import re
 
 
@@ -46,3 +48,43 @@ def redact_text(text):
 
         result = pattern.sub(replace, result)
     return result, stats
+
+
+def iter_index_records(input_root, date):
+    root = pathlib.Path(input_root)
+    index_path = root / date / "_request_index.jsonl"
+    with index_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except ValueError:
+                yield None, {"line": line_number, "reason": "bad_index_json"}
+                continue
+            if not record.get("request_id") or not record.get("file_path"):
+                yield None, {"line": line_number, "reason": "bad_index_record"}
+                continue
+            yield record, None
+
+
+def load_audit_record(input_root, index_record):
+    root = pathlib.Path(input_root)
+    detail_path = root / index_record["file_path"]
+    if not detail_path.exists():
+        return None, {
+            "request_id": index_record.get("request_id"),
+            "file_path": index_record.get("file_path"),
+            "reason": "missing_detail_file",
+        }
+    try:
+        with detail_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle), None
+    except ValueError:
+        return None, {
+            "request_id": index_record.get("request_id"),
+            "file_path": index_record.get("file_path"),
+            "reason": "bad_detail_json",
+        }
+

@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 
@@ -65,6 +67,55 @@ class RedactionTest(unittest.TestCase):
         self.assertNotEqual(first, other)
         self.assertNotIn("tenant-123", first)
         self.assertEqual(len(first), 16)
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+
+class AuditReadTest(unittest.TestCase):
+    def test_iter_index_records_skips_blank_and_bad_lines(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            day = root / "2026-07-15"
+            day.mkdir(parents=True)
+            index = day / "_request_index.jsonl"
+            index.write_text(
+                "\n"
+                "{\"request_id\":\"r1\",\"file_path\":\"2026-07-15/u/s/001.json\"}\n"
+                "{bad json}\n"
+                "{\"request_id\":\"r2\",\"file_path\":\"2026-07-15/u/s/002.json\"}\n",
+                encoding="utf-8",
+            )
+            events = list(pipeline.iter_index_records(root, "2026-07-15"))
+            records = [record for record, error in events if record is not None]
+            errors = [error for record, error in events if error is not None]
+            self.assertEqual([record["request_id"] for record in records], ["r1", "r2"])
+            self.assertEqual(errors[0]["reason"], "bad_index_json")
+
+    def test_load_audit_record_returns_error_for_missing_file(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            record = {"request_id": "missing", "file_path": "2026-07-15/u/s/nope.json"}
+            loaded, error = pipeline.load_audit_record(root, record)
+            self.assertIsNone(loaded)
+            self.assertEqual(error["reason"], "missing_detail_file")
+
+    def test_load_audit_record_loads_valid_json(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            detail_path = root / "2026-07-15" / "u" / "s" / "001.json"
+            write_json(detail_path, {"request_id": "r1", "status": "success"})
+            loaded, error = pipeline.load_audit_record(
+                root,
+                {"request_id": "r1", "file_path": "2026-07-15/u/s/001.json"},
+            )
+            self.assertIsNone(error)
+            self.assertEqual(loaded["request_id"], "r1")
 
 
 if __name__ == "__main__":
