@@ -40,6 +40,14 @@ class RedactionTest(unittest.TestCase):
         self.assertGreaterEqual(stats["cn_id"], 1)
         self.assertGreaterEqual(stats["secret"], 1)
 
+    def test_redact_text_preserves_space_between_bank_card_and_ip_tokens(self):
+        pipeline = load_pipeline_module()
+        text = "card 6222 0202 0202 0202 020 ip 192.168.0.1"
+        redacted, stats = pipeline.redact_text(text)
+        self.assertIn("<BANK_CARD_1> ip <IP_1>", redacted)
+        self.assertGreaterEqual(stats["bank_card"], 1)
+        self.assertGreaterEqual(stats["ip"], 1)
+
     def test_hash_identifier_is_deterministic_and_not_plaintext(self):
         pipeline = load_pipeline_module()
         first = pipeline.hash_identifier("tenant-123")
