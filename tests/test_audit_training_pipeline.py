@@ -318,6 +318,112 @@ class CanonicalBuildTest(unittest.TestCase):
         self.assertIsNone(canonical)
         self.assertEqual(reject["reason"], "missing_messages")
 
+    def test_build_canonical_sample_redacts_sensitive_dict_keys(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["messages"] = [
+            {
+                "role": "user",
+                "content": {
+                    "13800138000": "phone key",
+                    "+86 13800138000": "second phone key",
+                    "secret@example.com": "email key",
+                    "api_key=abcdefghijklmnopqrstuvwxyz123456": "secret key",
+                },
+            }
+        ]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        dumped = json.dumps(canonical, ensure_ascii=False)
+        self.assertNotIn("13800138000", dumped)
+        self.assertNotIn("secret@example.com", dumped)
+        self.assertNotIn("api_key=abcdefghijklmnopqrstuvwxyz123456", dumped)
+        redacted_content = canonical["request"]["messages"][0]["content"]
+        self.assertEqual(len(redacted_content), 4)
+        self.assertIn("<PHONE_1>", redacted_content)
+        self.assertIn("<PHONE_1>__2", redacted_content)
+        self.assertIn("<EMAIL_1>", redacted_content)
+        self.assertIn("<SECRET_1>", redacted_content)
+        self.assertTrue(canonical["quality"]["pii_redacted"])
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["phone"], 2)
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["email"], 1)
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["secret"], 1)
+
+    def test_build_canonical_sample_redacts_request_params_values(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"].update(
+            {
+                "stop": ["secret@example.com"],
+                "response_format": {"note": "联系 13800138000"},
+                "tool_choice": {"function": {"name": "api_key=abcdefghijklmnopqrstuvwxyz123456"}},
+                "user": "request-body-user",
+            }
+        )
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        dumped = json.dumps(canonical, ensure_ascii=False)
+        self.assertNotIn("secret@example.com", dumped)
+        self.assertNotIn("13800138000", dumped)
+        self.assertNotIn("api_key=abcdefghijklmnopqrstuvwxyz123456", dumped)
+        self.assertNotIn("request-body-user", dumped)
+        self.assertIn("<EMAIL_1>", canonical["request"]["params"]["stop"][0])
+        self.assertIn(
+            "<PHONE_1>", canonical["request"]["params"]["response_format"]["note"]
+        )
+        self.assertIn(
+            "<SECRET_1>",
+            canonical["request"]["params"]["tool_choice"]["function"]["name"],
+        )
+        self.assertTrue(canonical["quality"]["pii_redacted"])
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["email"], 1)
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["phone"], 1)
+        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["secret"], 1)
+
+    def test_build_canonical_sample_redacts_sensitive_values_across_payload(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"].update(
+            {
+                "messages": [
+                    {"role": "user", "content": {"13800138000": "call me"}}
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "联系 13900139000",
+                        },
+                    }
+                ],
+                "stop": ["secret@example.com"],
+            }
+        )
+        raw["response_body"]["choices"][0]["message"]["content"] = (
+            "Bearer sk-abcdefghijklmnopqrstuvwxyz1234567890"
+        )
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        dumped = json.dumps(canonical, ensure_ascii=False)
+        self.assertNotIn("13800138000", dumped)
+        self.assertNotIn("13900139000", dumped)
+        self.assertNotIn("secret@example.com", dumped)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz1234567890", dumped)
+        self.assertTrue(canonical["quality"]["pii_redacted"])
+
     def test_build_canonical_sample_hashes_are_deterministic(self):
         pipeline = load_pipeline_module()
         index = {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}

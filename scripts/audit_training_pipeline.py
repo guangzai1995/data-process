@@ -102,6 +102,17 @@ def content_hash(value):
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
+def unique_redacted_key(redacted_dict, key):
+    if key not in redacted_dict:
+        return key
+    suffix = 2
+    while True:
+        candidate = "%s__%d" % (key, suffix)
+        if candidate not in redacted_dict:
+            return candidate
+        suffix += 1
+
+
 def redact_value_tree(value):
     if isinstance(value, str):
         redacted, stats = redact_text(value)
@@ -119,8 +130,15 @@ def redact_value_tree(value):
         redacted_dict = {}
         merged = {}
         for key, item in value.items():
+            if isinstance(key, str):
+                redacted_key, key_stats = redact_text(key)
+            else:
+                redacted_key, key_stats = key, {}
+            redacted_key = unique_redacted_key(redacted_dict, redacted_key)
             redacted, stats = redact_value_tree(item)
-            redacted_dict[key] = redacted
+            redacted_dict[redacted_key] = redacted
+            for stat_key, count in key_stats.items():
+                merged[stat_key] = merged.get(stat_key, 0) + count
             for stat_key, count in stats.items():
                 merged[stat_key] = merged.get(stat_key, 0) + count
         return redacted_dict, merged
@@ -195,15 +213,23 @@ SAFE_REQUEST_PARAM_KEYS = (
 )
 
 
-def build_request_params(request_body, raw_record):
+def build_redacted_request_params(request_body, raw_record):
     params = {}
+    stats = {}
     if isinstance(request_body, dict):
         for key in SAFE_REQUEST_PARAM_KEYS:
             if key in request_body:
-                params[key] = request_body[key]
+                redacted, value_stats = redact_value_tree(request_body[key])
+                params[key] = redacted
+                stats = merge_counts(stats, value_stats)
     params["client_type"] = raw_record.get("client_type") or ""
     params["adapter_type"] = raw_record.get("adapter_type") or ""
     params["is_stream"] = bool(raw_record.get("is_stream"))
+    return params, stats
+
+
+def build_request_params(request_body, raw_record):
+    params, _stats = build_redacted_request_params(request_body, raw_record)
     return params
 
 
@@ -231,7 +257,8 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
     redacted_messages, message_stats = redact_value_tree(messages)
     redacted_tools, tool_stats = redact_value_tree(request_body.get("tools") or [])
     redacted_response, response_stats = redact_value_tree(response_message)
-    stats = merge_counts(message_stats, tool_stats, response_stats)
+    redacted_params, param_stats = build_redacted_request_params(request_body, raw_record)
+    stats = merge_counts(message_stats, tool_stats, response_stats, param_stats)
     request_payload_for_hash = {
         "date": date,
         "request_id": raw_record.get("request_id") or index_record.get("request_id"),
@@ -260,8 +287,8 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
             "request_path": raw_record.get("request_path"),
             "messages": redacted_messages,
             "tools": redacted_tools,
-            "tool_choice": request_body.get("tool_choice"),
-            "params": build_request_params(request_body, raw_record),
+            "tool_choice": redacted_params.get("tool_choice"),
+            "params": redacted_params,
         },
         "response": {
             "message": redacted_response,
