@@ -557,5 +557,103 @@ class ExporterTest(unittest.TestCase):
         self.assertIsNone(pipeline.export_tool_use_sft(canonical))
 
 
+    def test_export_sft_extracts_multipart_assistant_text(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"][0]["message"]["content"] = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+            {"text": "world"},
+        ]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        exported = pipeline.export_sft(canonical)
+        self.assertEqual(exported["output"], "hello\nworld")
+        self.assertNotIn("[{", exported["output"])
+        self.assertNotIn("'type'", exported["output"])
+
+    def test_export_sft_skips_non_text_assistant_content(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["response"]["message"]["content"] = {"text": "do not repr"}
+        self.assertIsNone(pipeline.export_sft(canonical))
+
+    def test_last_user_content_ignores_dict_and_router_avoids_repr(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["request"]["messages"] = [
+            {"role": "user", "content": {"prompt": "python code"}}
+        ]
+        router = pipeline.export_router(canonical)
+        self.assertEqual(pipeline.last_user_content(canonical["request"]["messages"]), "")
+        self.assertEqual(router["input"], "")
+        self.assertNotIn("{'prompt'", router["input"])
+
+    def test_multipart_user_content_drives_rule_classification(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["request"]["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请分析这个问题"},
+                    {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+                ],
+            }
+        ]
+        self.assertEqual(pipeline.last_user_content(canonical["request"]["messages"]), "请分析这个问题")
+        self.assertEqual(pipeline.classify_by_rules(canonical), "reasoning")
+
+    def test_export_tool_use_sft_skips_length_outputs(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search"}}
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "length"
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        self.assertIsNone(pipeline.export_tool_use_sft(canonical))
+
+    def test_export_router_ignores_malformed_model_label_confidence(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": "0.9"}
+        router = pipeline.export_router(canonical)
+        self.assertEqual(router["labels"]["rule_label"], "code_generation")
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+        canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": None}
+        router = pipeline.export_router(canonical)
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+
+
 if __name__ == "__main__":
     unittest.main()

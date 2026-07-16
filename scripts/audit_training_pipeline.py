@@ -325,21 +325,29 @@ ROUTE_LABELS = set([
 ])
 
 
+def extract_text_content(content):
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                if part.get("type") in (None, "text"):
+                    text = part["text"].strip()
+                    if text:
+                        parts.append(text)
+            elif isinstance(part, str):
+                text = part.strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
 def last_user_content(messages):
     for message in reversed(messages):
         if message.get("role") == "user":
-            content = message.get("content")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        parts.append(part["text"])
-                    elif isinstance(part, str):
-                        parts.append(part)
-                return "\n".join(parts)
-            if content is None:
-                return ""
-            return str(content)
+            return extract_text_content(message.get("content"))
     return ""
 
 
@@ -370,9 +378,10 @@ def classify_by_rules(canonical):
 
 def final_route_label(canonical):
     model_label = canonical["routing"].get("model_label")
-    if isinstance(model_label, dict) and model_label.get("confidence", 0) >= 0.75:
+    if isinstance(model_label, dict):
         label = model_label.get("label")
-        if label in ROUTE_LABELS:
+        confidence = model_label.get("confidence")
+        if label in ROUTE_LABELS and isinstance(confidence, (int, float)) and confidence >= 0.75:
             return label, "high"
     rule_label = classify_by_rules(canonical)
     if rule_label in ROUTE_LABELS:
@@ -382,8 +391,12 @@ def final_route_label(canonical):
 
 def export_sft(canonical):
     message = canonical["response"]["message"]
-    content = str(message.get("content") or "").strip()
-    if has_tool_interaction(canonical) or canonical["response"].get("finish_reason") == "length":
+    content = extract_text_content(message.get("content"))
+    if (
+        not content
+        or has_tool_interaction(canonical)
+        or canonical["response"].get("finish_reason") == "length"
+    ):
         return None
     return {
         "sample_id": canonical["sample_id"],
@@ -399,6 +412,8 @@ def export_sft(canonical):
 
 
 def export_tool_use_sft(canonical):
+    if canonical["response"].get("finish_reason") == "length":
+        return None
     if not has_tool_interaction(canonical):
         return None
     return {
