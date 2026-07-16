@@ -175,13 +175,97 @@ def merge_counts(*dicts):
     return merged
 
 
+def file_path_hash(index_record):
+    return hash_identifier(index_record.get("file_path"))
+
+
 def reject_record(date, index_record, reason):
     return {
         "date": date,
         "request_id": index_record.get("request_id"),
-        "file_path": index_record.get("file_path"),
+        "file_path_hash": file_path_hash(index_record),
         "reason": reason,
     }
+
+
+USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def sanitize_usage(usage):
+    if not isinstance(usage, dict):
+        return None
+    sanitized = {}
+    for key in USAGE_TOKEN_FIELDS:
+        if key not in usage:
+            continue
+        value = usage[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return None
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        sanitized[key] = value
+    return sanitized
+
+
+def valid_message_content(content):
+    if content is None:
+        return False
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if isinstance(part, str):
+            continue
+        if not isinstance(part, dict):
+            return False
+        if "text" in part and not isinstance(part.get("text"), str):
+            return False
+    return True
+
+
+def valid_messages(messages):
+    if not isinstance(messages, list) or not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        if not isinstance(message.get("role"), str):
+            return False
+        if "content" not in message:
+            return False
+        if not valid_message_content(message.get("content")):
+            return False
+    return True
+
+
+def valid_tools(tools):
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+    return True
+
+
+def valid_response_message(message):
+    if not isinstance(message, dict):
+        return False
+    if "content" in message and not valid_message_content(message.get("content")):
+        return False
+    if "tool_calls" in message:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return False
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                return False
+    return True
 
 
 SAFE_REQUEST_PARAM_KEYS = (
@@ -229,10 +313,24 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
     messages = request_body.get("messages")
     if not isinstance(messages, list) or not messages:
         return None, reject_record(date, index_record, "missing_messages")
+    if not valid_messages(messages):
+        return None, reject_record(date, index_record, "invalid_messages")
+    tools = request_body.get("tools", [])
+    if tools is None:
+        tools = []
+    if not valid_tools(tools):
+        return None, reject_record(date, index_record, "invalid_tools")
     choice = first_response_choice(raw_record)
     if choice is None:
         return None, reject_record(date, index_record, "missing_choices")
+    if not isinstance(choice.get("message"), dict):
+        return None, reject_record(date, index_record, "invalid_response_message")
     response_message = response_message_from_choice(choice)
+    if not valid_response_message(response_message):
+        return None, reject_record(date, index_record, "invalid_response_message")
+    usage = sanitize_usage((raw_record.get("response_body") or {}).get("usage"))
+    if usage is None:
+        return None, reject_record(date, index_record, "invalid_usage")
     response_text = assistant_text_from_choice(choice)
     if not response_text and not response_message.get("tool_calls"):
         return None, reject_record(date, index_record, "empty_assistant_response")
@@ -242,7 +340,7 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
         return None, reject_record(date, index_record, "response_too_long")
 
     redacted_messages, message_stats = redact_value_tree(messages)
-    redacted_tools, tool_stats = redact_value_tree(request_body.get("tools") or [])
+    redacted_tools, tool_stats = redact_value_tree(tools)
     redacted_response, response_stats = redact_value_tree(response_message)
     redacted_params, param_stats = build_redacted_request_params(request_body, raw_record)
     stats = merge_counts(message_stats, tool_stats, response_stats, param_stats)
@@ -264,7 +362,7 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
         "source": {
             "date": date,
             "request_id": raw_record.get("request_id") or index_record.get("request_id"),
-            "file_path": index_record.get("file_path"),
+            "file_path_hash": file_path_hash(index_record),
             "tenant_hash": hash_identifier(raw_record.get("tenant_id")),
             "user_hash": hash_identifier(raw_record.get("user_id")),
             "session_hash": hash_identifier(raw_record.get("session_id")),
@@ -280,7 +378,7 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
         "response": {
             "message": redacted_response,
             "finish_reason": finish_reason,
-            "usage": (raw_record.get("response_body") or {}).get("usage") or {},
+            "usage": usage,
         },
         "routing": {
             "weak_model_label": raw_record.get("model") or request_body.get("model"),
@@ -673,7 +771,7 @@ def safe_remove_tree_leaf(path, root):
 def unsafe_detail_path_error(index_record):
     return {
         "request_id": index_record.get("request_id"),
-        "file_path": index_record.get("file_path"),
+        "file_path_hash": file_path_hash(index_record),
         "reason": "unsafe_detail_path",
     }
 
@@ -900,6 +998,16 @@ def write_stream_record(handles, relative, record):
         write_jsonl_record(handles[relative], record)
 
 
+def apply_optional_model_label(canonical, label_config):
+    if not label_config.get("enabled"):
+        return
+    router_record = export_router(canonical)
+    model_label, _error = call_label_model(router_record, label_config)
+    normalized = normalize_model_label(model_label)
+    if normalized is not None:
+        canonical["routing"]["model_label"] = normalized
+
+
 def write_canonical_exports(handles, date, canonical):
     write_stream_record(handles, "canonical/%s.jsonl" % date, canonical)
     if "sft" in canonical["quality"].get("task_types", []):
@@ -928,6 +1036,10 @@ def write_reject(handles, date, reject):
     write_stream_record(handles, "reports/%s.rejects.jsonl" % date, reject)
 
 
+def reject_json_constant(value):
+    raise ValueError("non-standard JSON constant: %s" % value)
+
+
 def load_audit_record(input_root, index_record):
     root = pathlib.Path(input_root).resolve()
     try:
@@ -937,16 +1049,16 @@ def load_audit_record(input_root, index_record):
     if not detail_path.exists():
         return None, {
             "request_id": index_record.get("request_id"),
-            "file_path": index_record.get("file_path"),
+            "file_path_hash": file_path_hash(index_record),
             "reason": "missing_detail_file",
         }
     try:
         with detail_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle), None
+            return json.load(handle, parse_constant=reject_json_constant), None
     except ValueError:
         return None, {
             "request_id": index_record.get("request_id"),
-            "file_path": index_record.get("file_path"),
+            "file_path_hash": file_path_hash(index_record),
             "reason": "bad_detail_json",
         }
 
@@ -963,19 +1075,21 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
     files_attempted = 0
     files_loaded = 0
     commit_started = False
+    label_config = load_label_config()
     try:
         if not dry_run:
             output_root_path, tmp_root, backup_root = prepare_tmp_roots(output_root_path, date)
             handles = open_stream_writers(tmp_root, date)
         for index_record, index_error in iter_index_records(input_root, date):
             if index_error is not None:
+                index_record_count += 1
                 update_stats_for_reject(stats, index_error)
                 if not dry_run:
                     write_reject(handles, date, index_error)
                 continue
-            index_record_count += 1
             if limit is not None and files_attempted >= limit:
                 break
+            index_record_count += 1
             files_attempted += 1
             raw, error = load_audit_record(input_root, index_record)
             if error:
@@ -990,6 +1104,7 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
                 if not dry_run:
                     write_reject(handles, date, reject)
                 continue
+            apply_optional_model_label(canonical, label_config)
             update_stats_for_canonical(stats, canonical)
             if not dry_run:
                 write_canonical_exports(handles, date, canonical)
@@ -1034,6 +1149,8 @@ def yesterday_date():
 
 
 def date_range(start_date, end_date):
+    validate_date_string(start_date)
+    validate_date_string(end_date)
     start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
     end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
     if start > end:
@@ -1081,7 +1198,10 @@ def resolve_dates(args):
     if args.yesterday:
         return [yesterday_date()]
     if args.date:
-        return [args.date]
+        try:
+            return [validate_date_string(args.date)]
+        except ValueError as exc:
+            raise SystemExit(str(exc))
     if not (args.start_date and args.end_date):
         raise SystemExit("Provide --start-date with --end-date")
     try:
@@ -1092,7 +1212,6 @@ def resolve_dates(args):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    results = []
     for date in resolve_dates(args):
         result = process_date(
             args.input_root,
@@ -1101,7 +1220,6 @@ def main(argv=None):
             limit=args.limit,
             dry_run=args.dry_run,
         )
-        results.append(result)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
 

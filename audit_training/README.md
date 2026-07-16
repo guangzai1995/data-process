@@ -1,33 +1,60 @@
 # Audit Training Outputs
 
 This directory is the default output root for `scripts/audit_training_pipeline.py`.
+Generated dataset files are ignored by Git by default. Keep only this README under version control.
 
-Generated files are ignored by Git by default. Keep only this README under version control.
+## Runs
 
 Daily run:
 
 ```bash
-python3 scripts/audit_training_pipeline.py --yesterday
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --yesterday
 ```
 
 Backfill:
 
 ```bash
-python3 scripts/audit_training_pipeline.py --start-date 2026-07-01 --end-date 2026-07-15
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --start-date 2026-07-01 --end-date 2026-07-15
 ```
 
-Validation run:
+Validation run without final outputs:
 
 ```bash
-python3 scripts/audit_training_pipeline.py --date 2026-07-15 --limit 100 --dry-run
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --date 2026-07-15 --limit 100 --dry-run
 ```
 
-Optional labeler environment:
+Cron example:
+
+```cron
+15 2 * * * cd /path/to/repo && PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --yesterday >> audit_training/logs/cron.log 2>&1
+```
+
+## Outputs
+
+For each date, the pipeline writes:
+
+```text
+canonical/<date>.jsonl
+sft/<date>.jsonl
+tool_use_sft/<date>.jsonl
+router_classification/<date>.jsonl
+label_queue/<date>.jsonl
+reports/<date>.rejects.jsonl
+reports/<date>.stats.json
+manifests/<date>.manifest.json
+```
+
+Files are written through `.tmp/` and then atomically moved into place.
+
+## Optional Labeler
+
+Set these environment variables to enable route-label model calls:
 
 ```text
 AUDIT_LABEL_BASE_URL
 AUDIT_LABEL_API_KEY
 AUDIT_LABEL_MODEL
 AUDIT_LABEL_TIMEOUT
-AUDIT_LABEL_MAX_CONCURRENCY
 ```
+
+Labeling currently runs sequentially in the streaming pipeline. If the labeler is disabled, unreachable, or returns an invalid response, the sample still exports with rule-based routing and no raw prompt or exception detail is written to outputs.

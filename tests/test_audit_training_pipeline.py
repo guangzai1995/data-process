@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import math
+import os
 import pathlib
 import sys
 import tempfile
@@ -54,6 +55,17 @@ class CliTest(unittest.TestCase):
         args = pipeline.parse_args([])
         with self.assertRaises(SystemExit):
             pipeline.resolve_dates(args)
+
+    def test_resolve_dates_rejects_invalid_single_date(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args(["--date", "2026-7-1"])
+        with self.assertRaises(SystemExit):
+            pipeline.resolve_dates(args)
+
+    def test_date_range_rejects_non_strict_dates(self):
+        pipeline = load_pipeline_module()
+        with self.assertRaises(ValueError):
+            pipeline.date_range("2026-7-1", "2026-07-02")
 
     def test_main_processes_each_date_and_prints_json_lines(self):
         pipeline = load_pipeline_module()
@@ -249,6 +261,22 @@ class AuditReadTest(unittest.TestCase):
 
 
 
+    def test_load_audit_record_rejects_non_standard_json_constants(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            detail_path = root / "2026-07-15" / "u" / "s" / "001.json"
+            detail_path.parent.mkdir(parents=True)
+            detail_path.write_text('{"request_id":"r1","value":NaN}', encoding="utf-8")
+            loaded, error = pipeline.load_audit_record(
+                root,
+                {"request_id": "r1", "file_path": "2026-07-15/u/s/001.json"},
+            )
+            self.assertIsNone(loaded)
+            self.assertEqual(error["reason"], "bad_detail_json")
+
+
+
 def sample_success_record():
     return {
         "timestamp": "2026-07-15T00:00:00+08:00",
@@ -292,6 +320,8 @@ class CanonicalBuildTest(unittest.TestCase):
         )
         self.assertIsNone(reject)
         self.assertEqual(canonical["source"]["date"], "2026-07-15")
+        self.assertIn("file_path_hash", canonical["source"])
+        self.assertNotIn("file_path", canonical["source"])
         self.assertEqual(canonical["routing"]["weak_model_label"], "glm-5.2")
         self.assertEqual(canonical["quality"]["status"], "accepted")
         self.assertIn("<PHONE_1>", canonical["request"]["messages"][0]["content"])
@@ -444,40 +474,19 @@ class CanonicalBuildTest(unittest.TestCase):
         self.assertIsNone(canonical)
         self.assertEqual(reject["reason"], "missing_messages")
 
-    def test_build_canonical_sample_redacts_sensitive_dict_keys(self):
+    def test_build_canonical_sample_rejects_dict_message_content(self):
         pipeline = load_pipeline_module()
         raw = sample_success_record()
         raw["request_body"]["messages"] = [
-            {
-                "role": "user",
-                "content": {
-                    "13800138000": "phone key",
-                    "+86 13800138000": "second phone key",
-                    "secret@example.com": "email key",
-                    "api_key=abcdefghijklmnopqrstuvwxyz123456": "secret key",
-                },
-            }
+            {"role": "user", "content": {"prompt": "do not accept dict content"}}
         ]
         canonical, reject = pipeline.build_canonical_sample(
             "2026-07-15",
             {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
             raw,
         )
-        self.assertIsNone(reject)
-        dumped = json.dumps(canonical, ensure_ascii=False)
-        self.assertNotIn("13800138000", dumped)
-        self.assertNotIn("secret@example.com", dumped)
-        self.assertNotIn("api_key=abcdefghijklmnopqrstuvwxyz123456", dumped)
-        redacted_content = canonical["request"]["messages"][0]["content"]
-        self.assertEqual(len(redacted_content), 4)
-        self.assertIn("<PHONE_1>", redacted_content)
-        self.assertIn("<PHONE_1>__2", redacted_content)
-        self.assertIn("<EMAIL_1>", redacted_content)
-        self.assertIn("<SECRET_1>", redacted_content)
-        self.assertTrue(canonical["quality"]["pii_redacted"])
-        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["phone"], 2)
-        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["email"], 1)
-        self.assertGreaterEqual(canonical["quality"]["redaction_stats"]["secret"], 1)
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "invalid_messages")
 
     def test_build_canonical_sample_redacts_request_params_values(self):
         pipeline = load_pipeline_module()
@@ -520,7 +529,7 @@ class CanonicalBuildTest(unittest.TestCase):
         raw["request_body"].update(
             {
                 "messages": [
-                    {"role": "user", "content": {"13800138000": "call me"}}
+                    {"role": "user", "content": "call me 13800138000"}
                 ],
                 "tools": [
                     {
@@ -595,6 +604,91 @@ class CanonicalBuildTest(unittest.TestCase):
         )
         self.assertIsNone(canonical)
         self.assertEqual(reject["reason"], "prompt_too_long")
+
+
+    def test_build_canonical_sample_rejects_invalid_usage_values(self):
+        pipeline = load_pipeline_module()
+        invalid_usages = [
+            "not-a-dict",
+            {"prompt_tokens": "10"},
+            {"prompt_tokens": True},
+            {"prompt_tokens": float("nan")},
+            {"prompt_tokens": float("inf")},
+            {"prompt_tokens": -1},
+        ]
+        for usage in invalid_usages:
+            with self.subTest(usage=usage):
+                raw = sample_success_record()
+                raw["response_body"]["usage"] = usage
+                canonical, reject = pipeline.build_canonical_sample(
+                    "2026-07-15",
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                    raw,
+                )
+                self.assertIsNone(canonical)
+                self.assertEqual(reject["reason"], "invalid_usage")
+
+    def test_build_canonical_sample_keeps_only_sanitized_usage_token_fields(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["usage"] = {
+            "prompt_tokens": 10.0,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "debug": "secret@example.com",
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        self.assertEqual(
+            canonical["response"]["usage"],
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+
+    def test_build_canonical_sample_rejects_invalid_message_schema(self):
+        pipeline = load_pipeline_module()
+        cases = [
+            (["not-a-dict"], "invalid_messages"),
+            ([{"role": 123, "content": "hello"}], "invalid_messages"),
+            ([{"role": "user"}], "invalid_messages"),
+            ([{"role": "user", "content": [{"text": 123}]}], "invalid_messages"),
+        ]
+        for messages, reason in cases:
+            with self.subTest(messages=messages):
+                raw = sample_success_record()
+                raw["request_body"]["messages"] = messages
+                canonical, reject = pipeline.build_canonical_sample(
+                    "2026-07-15",
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                    raw,
+                )
+                self.assertIsNone(canonical)
+                self.assertEqual(reject["reason"], reason)
+
+    def test_build_canonical_sample_rejects_invalid_tools_and_tool_calls(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = {"bad": "shape"}
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "invalid_tools")
+
+        raw = sample_success_record()
+        raw["response_body"]["choices"][0]["message"]["tool_calls"] = ["bad"]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "invalid_response_message")
 
 
 class ExporterTest(unittest.TestCase):
@@ -871,7 +965,7 @@ class ExporterTest(unittest.TestCase):
         raw["request_body"]["messages"] = [
             {
                 "role": "system",
-                "content": {"debug": "do not export"},
+                "content": "",
             },
             {
                 "role": "user",
@@ -1322,6 +1416,152 @@ class PipelineRunTest(unittest.TestCase):
             )
             self.assertNotIn("messages", rejects)
             self.assertNotIn("13800138000", rejects)
+
+    def test_process_date_hashes_file_paths_in_canonical_and_rejects(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw_path = "2026-07-15/tenant-1/user-1/session-1/001.json"
+            write_json(input_root / raw_path, sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": raw_path}) + "\n"
+                + json.dumps({"request_id": "missing", "file_path": "2026-07-15/tenant-1/user-1/session-1/missing.json"}) + "\n",
+                encoding="utf-8",
+            )
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+            canonical_text = (output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8")
+            rejects_text = (output_root / "reports" / "2026-07-15.rejects.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("tenant-1/user-1/session-1", canonical_text)
+            self.assertNotIn("tenant-1/user-1/session-1", rejects_text)
+            canonical = json.loads(canonical_text)
+            reject = json.loads(rejects_text)
+            self.assertIn("file_path_hash", canonical["source"])
+            self.assertIn("file_path_hash", reject)
+
+    def test_process_date_rejects_detail_with_non_standard_json_constant(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            detail = day / "u" / "s" / "001.json"
+            detail.parent.mkdir(parents=True)
+            detail.write_text('{"request_id":"request-1","status":"success","value":Infinity}', encoding="utf-8")
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+            self.assertEqual(result["accepted"], 0)
+            self.assertEqual(result["rejected"], 1)
+            self.assertEqual(result["reject_reasons"], {"bad_detail_json": 1})
+            self.assertEqual(
+                (output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8"),
+                "",
+            )
+
+    def test_process_date_applies_successful_labeler_to_canonical_and_router(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": '{"label":"tool_agent","confidence":0.91,"reason":"uses tools"}'}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            return FakeResponse()
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = fake_urlopen
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                write_json(day / "u" / "s" / "001.json", sample_success_record())
+                (day / "_request_index.jsonl").write_text(
+                    json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                    encoding="utf-8",
+                )
+                pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                canonical = json.loads((output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8"))
+                router = json.loads((output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8"))
+                self.assertEqual(canonical["routing"]["model_label"], {"label": "tool_agent", "confidence": 0.91})
+                self.assertEqual(router["labels"]["model_label"], {"label": "tool_agent", "confidence": 0.91})
+                self.assertEqual(router["labels"]["final_label"], "tool_agent")
+                self.assertEqual(router["labels"]["confidence"], "high")
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_date_labeler_invalid_response_safely_degrades(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": '{"label":"bad_label","confidence":0.99,"reason":"secret@example.com"}'}}]
+                }).encode("utf-8")
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = lambda request, timeout=None: FakeResponse()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                write_json(day / "u" / "s" / "001.json", sample_success_record())
+                (day / "_request_index.jsonl").write_text(
+                    json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                    encoding="utf-8",
+                )
+                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                router_text = (output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8")
+                router = json.loads(router_text)
+                self.assertEqual(result["accepted"], 1)
+                self.assertIsNone(router["labels"]["model_label"])
+                self.assertEqual(router["labels"]["final_label"], "code_generation")
+                self.assertNotIn("secret@example.com", router_text)
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
 
     def test_process_date_dry_run_leaves_no_outputs_or_tmp(self):
         pipeline = load_pipeline_module()
