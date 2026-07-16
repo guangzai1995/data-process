@@ -76,26 +76,6 @@ def iter_index_records(input_root, date):
             yield record, None
 
 
-def load_audit_record(input_root, index_record):
-    root = pathlib.Path(input_root)
-    detail_path = root / index_record["file_path"]
-    if not detail_path.exists():
-        return None, {
-            "request_id": index_record.get("request_id"),
-            "file_path": index_record.get("file_path"),
-            "reason": "missing_detail_file",
-        }
-    try:
-        with detail_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle), None
-    except ValueError:
-        return None, {
-            "request_id": index_record.get("request_id"),
-            "file_path": index_record.get("file_path"),
-            "reason": "bad_detail_json",
-        }
-
-
 
 def stable_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -614,44 +594,113 @@ import datetime
 import shutil
 
 
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+JSONL_OUTPUTS = (
+    "canonical/%s.jsonl",
+    "sft/%s.jsonl",
+    "tool_use_sft/%s.jsonl",
+    "router_classification/%s.jsonl",
+    "label_queue/%s.jsonl",
+    "reports/%s.rejects.jsonl",
+)
+
+
+def validate_date_string(date):
+    if not isinstance(date, str) or DATE_PATTERN.match(date) is None:
+        raise ValueError("date must be YYYY-MM-DD")
+    try:
+        datetime.datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("date must be a valid YYYY-MM-DD date")
+    return date
+
+
+def validate_relative_path(relative):
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("relative path must be a non-empty string")
+    path = pathlib.PurePath(relative)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("unsafe relative path: %s" % relative)
+    return relative
+
+
+def path_under(root, relative):
+    validate_relative_path(relative)
+    root = pathlib.Path(root).resolve()
+    candidate = (root / relative).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise ValueError("path escapes root: %s" % relative)
+    return candidate
+
+
+def unsafe_detail_path_error(index_record):
+    return {
+        "request_id": index_record.get("request_id"),
+        "file_path": index_record.get("file_path"),
+        "reason": "unsafe_detail_path",
+    }
+
+
 def write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            write_jsonl_record(handle, record)
+
+
+def write_jsonl_record(handle, record):
+    handle.write(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+    )
 
 
 def write_json_file(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2),
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False),
         encoding="utf-8",
     )
 
 
 def build_stats(canonical_records, rejects):
-    stats = {
-        "accepted": len(canonical_records),
-        "rejected": len(rejects),
+    stats = init_stats()
+    for canonical in canonical_records:
+        update_stats_for_canonical(stats, canonical)
+    for reject in rejects:
+        update_stats_for_reject(stats, reject)
+    return stats
+
+
+def init_stats():
+    return {
+        "accepted": 0,
+        "rejected": 0,
         "models": {},
         "finish_reasons": {},
         "task_types": {},
         "reject_reasons": {},
         "redaction_hits": {},
     }
-    for canonical in canonical_records:
-        model = canonical["request"].get("model") or "unknown"
-        stats["models"][model] = stats["models"].get(model, 0) + 1
-        finish_reason = canonical["response"].get("finish_reason") or "unknown"
-        stats["finish_reasons"][finish_reason] = stats["finish_reasons"].get(finish_reason, 0) + 1
-        for task_type in canonical["quality"].get("task_types", []):
-            stats["task_types"][task_type] = stats["task_types"].get(task_type, 0) + 1
-        for key, value in canonical["quality"].get("redaction_stats", {}).items():
-            stats["redaction_hits"][key] = stats["redaction_hits"].get(key, 0) + value
-    for reject in rejects:
-        reason = reject.get("reason", "unknown")
-        stats["reject_reasons"][reason] = stats["reject_reasons"].get(reason, 0) + 1
-    return stats
+
+
+def update_stats_for_canonical(stats, canonical):
+    stats["accepted"] += 1
+    model = canonical["request"].get("model") or "unknown"
+    stats["models"][model] = stats["models"].get(model, 0) + 1
+    finish_reason = canonical["response"].get("finish_reason") or "unknown"
+    stats["finish_reasons"][finish_reason] = stats["finish_reasons"].get(finish_reason, 0) + 1
+    for task_type in canonical["quality"].get("task_types", []):
+        stats["task_types"][task_type] = stats["task_types"].get(task_type, 0) + 1
+    for key, value in canonical["quality"].get("redaction_stats", {}).items():
+        stats["redaction_hits"][key] = stats["redaction_hits"].get(key, 0) + value
+
+
+def update_stats_for_reject(stats, reject):
+    stats["rejected"] += 1
+    reason = reject.get("reason", "unknown")
+    stats["reject_reasons"][reason] = stats["reject_reasons"].get(reason, 0) + 1
 
 
 def append_if_record(records, record):
@@ -660,6 +709,7 @@ def append_if_record(records, record):
 
 
 def collect_outputs(date, canonical_records, rejects, label_queue, stats, manifest):
+    validate_date_string(date)
     sft_records = []
     tool_records = []
     router_records = []
@@ -688,74 +738,234 @@ def collect_outputs(date, canonical_records, rejects, label_queue, stats, manife
     }
 
 
-def write_outputs_atomically(output_root, date, outputs):
+def output_relative_paths(date):
+    validate_date_string(date)
+    paths = [template % date for template in JSONL_OUTPUTS]
+    paths.append("reports/%s.stats.json" % date)
+    paths.append("manifests/%s.manifest.json" % date)
+    return paths
+
+
+def prepare_tmp_roots(output_root, date):
+    validate_date_string(date)
     output_root = pathlib.Path(output_root)
-    tmp_root = output_root / ".tmp" / date
-    if tmp_root.exists():
-        shutil.rmtree(str(tmp_root))
+    tmp_root = path_under(output_root, ".tmp/%s" % date)
+    backup_root = path_under(output_root, ".tmp/%s.backup" % date)
+    for root in (tmp_root, backup_root):
+        if root.exists():
+            shutil.rmtree(str(root))
     tmp_root.mkdir(parents=True)
+    return output_root, tmp_root, backup_root
+
+
+def cleanup_path(path):
+    if path.exists():
+        if path.is_dir():
+            shutil.rmtree(str(path))
+        else:
+            path.unlink()
+
+
+def rollback_replacements(created_finals, backups):
+    for final in reversed(created_finals):
+        if final.exists():
+            final.unlink()
+    for final, backup in reversed(backups):
+        if backup.exists():
+            final.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(backup), str(final))
+
+
+def commit_tmp_outputs(output_root, date, relative_paths):
+    output_root = pathlib.Path(output_root)
+    tmp_root = path_under(output_root, ".tmp/%s" % date)
+    backup_root = path_under(output_root, ".tmp/%s.backup" % date)
+    backups = []
+    created_finals = []
+    try:
+        for relative in relative_paths:
+            final = path_under(output_root, relative)
+            temp_file = path_under(tmp_root, relative)
+            backup_file = path_under(backup_root, relative)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            if final.exists():
+                backup_file.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(str(final), str(backup_file))
+                backups.append((final, backup_file))
+            else:
+                created_finals.append(final)
+            os.replace(str(temp_file), str(final))
+    except Exception:
+        rollback_replacements(created_finals, backups)
+        raise
+    finally:
+        cleanup_path(tmp_root)
+        cleanup_path(backup_root)
+
+
+def write_outputs_atomically(output_root, date, outputs):
+    output_root, tmp_root, backup_root = prepare_tmp_roots(output_root, date)
+    relative_paths = []
     try:
         for relative, value in outputs.items():
-            target = tmp_root / relative
+            validate_relative_path(relative)
+            relative_paths.append(relative)
+            target = path_under(tmp_root, relative)
             if relative.endswith(".jsonl"):
                 write_jsonl(target, value)
             else:
                 write_json_file(target, value)
-        for relative in outputs:
-            final = output_root / relative
-            final.parent.mkdir(parents=True, exist_ok=True)
-            temp_file = tmp_root / relative
-            if final.exists():
-                final.unlink()
-            shutil.move(str(temp_file), str(final))
-    finally:
-        if tmp_root.exists():
-            shutil.rmtree(str(tmp_root))
+        commit_tmp_outputs(output_root, date, relative_paths)
+    except Exception:
+        cleanup_path(tmp_root)
+        cleanup_path(backup_root)
+        raise
+
+
+def open_stream_writers(tmp_root, date):
+    handles = {}
+    for relative in [template % date for template in JSONL_OUTPUTS]:
+        path = path_under(tmp_root, relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handles[relative] = path.open("w", encoding="utf-8")
+    return handles
+
+
+def close_stream_writers(handles):
+    first_error = None
+    for handle in handles.values():
+        try:
+            handle.close()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def write_stream_record(handles, relative, record):
+    if record is not None:
+        write_jsonl_record(handles[relative], record)
+
+
+def write_canonical_exports(handles, date, canonical):
+    write_stream_record(handles, "canonical/%s.jsonl" % date, canonical)
+    if "sft" in canonical["quality"].get("task_types", []):
+        write_stream_record(handles, "sft/%s.jsonl" % date, export_sft(canonical))
+    if "tool_use_sft" in canonical["quality"].get("task_types", []):
+        write_stream_record(
+            handles,
+            "tool_use_sft/%s.jsonl" % date,
+            export_tool_use_sft(canonical),
+        )
+    router_record = export_router(canonical)
+    write_stream_record(handles, "router_classification/%s.jsonl" % date, router_record)
+    if router_record is not None and router_record["labels"].get("confidence") == "low":
+        write_stream_record(
+            handles,
+            "label_queue/%s.jsonl" % date,
+            {
+                "sample_id": canonical["sample_id"],
+                "reason": "low_confidence_route",
+                "router": router_record,
+            },
+        )
+
+
+def write_reject(handles, date, reject):
+    write_stream_record(handles, "reports/%s.rejects.jsonl" % date, reject)
+
+
+def load_audit_record(input_root, index_record):
+    root = pathlib.Path(input_root).resolve()
+    try:
+        detail_path = path_under(root, index_record["file_path"])
+    except (KeyError, ValueError):
+        return None, unsafe_detail_path_error(index_record)
+    if not detail_path.exists():
+        return None, {
+            "request_id": index_record.get("request_id"),
+            "file_path": index_record.get("file_path"),
+            "reason": "missing_detail_file",
+        }
+    try:
+        with detail_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle), None
+    except ValueError:
+        return None, {
+            "request_id": index_record.get("request_id"),
+            "file_path": index_record.get("file_path"),
+            "reason": "bad_detail_json",
+        }
 
 
 def process_date(input_root, output_root, date, limit=None, dry_run=False):
+    validate_date_string(date)
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
-    canonical_records = []
-    rejects = []
-    label_queue = []
+    output_root_path = pathlib.Path(output_root)
+    tmp_root = None
+    handles = {}
+    if not dry_run:
+        output_root_path, tmp_root, backup_root = prepare_tmp_roots(output_root_path, date)
+        handles = open_stream_writers(tmp_root, date)
+    stats = init_stats()
     index_record_count = 0
     files_attempted = 0
     files_loaded = 0
-    for index_record, index_error in iter_index_records(input_root, date):
-        if index_error is not None:
-            rejects.append(index_error)
-            continue
-        index_record_count += 1
-        if limit is not None and files_attempted >= limit:
-            break
-        files_attempted += 1
-        raw, error = load_audit_record(input_root, index_record)
-        if error:
-            rejects.append(error)
-            continue
-        files_loaded += 1
-        canonical, reject = build_canonical_sample(date, index_record, raw)
-        if reject:
-            rejects.append(reject)
-            continue
-        canonical_records.append(canonical)
-    finished_at = datetime.datetime.utcnow().isoformat() + "Z"
-    stats = build_stats(canonical_records, rejects)
-    manifest = {
-        "date": date,
-        "input_root": str(input_root),
-        "output_root": str(output_root),
-        "index_records": index_record_count,
-        "files_attempted": files_attempted,
-        "files_loaded": files_loaded,
-        "accepted": len(canonical_records),
-        "rejected": len(rejects),
-        "pipeline_version": PIPELINE_VERSION,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "dry_run": bool(dry_run),
-    }
-    outputs = collect_outputs(date, canonical_records, rejects, label_queue, stats, manifest)
-    if not dry_run:
-        write_outputs_atomically(output_root, date, outputs)
-    return manifest
+    try:
+        for index_record, index_error in iter_index_records(input_root, date):
+            if index_error is not None:
+                update_stats_for_reject(stats, index_error)
+                if not dry_run:
+                    write_reject(handles, date, index_error)
+                continue
+            index_record_count += 1
+            if limit is not None and files_attempted >= limit:
+                break
+            files_attempted += 1
+            raw, error = load_audit_record(input_root, index_record)
+            if error:
+                update_stats_for_reject(stats, error)
+                if not dry_run:
+                    write_reject(handles, date, error)
+                continue
+            files_loaded += 1
+            canonical, reject = build_canonical_sample(date, index_record, raw)
+            if reject:
+                update_stats_for_reject(stats, reject)
+                if not dry_run:
+                    write_reject(handles, date, reject)
+                continue
+            update_stats_for_canonical(stats, canonical)
+            if not dry_run:
+                write_canonical_exports(handles, date, canonical)
+        finished_at = datetime.datetime.utcnow().isoformat() + "Z"
+        manifest = {
+            "date": date,
+            "input_root": str(input_root),
+            "output_root": str(output_root),
+            "index_records": index_record_count,
+            "files_attempted": files_attempted,
+            "files_loaded": files_loaded,
+            "accepted": stats["accepted"],
+            "rejected": stats["rejected"],
+            "reject_reasons": stats["reject_reasons"],
+            "pipeline_version": PIPELINE_VERSION,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "dry_run": bool(dry_run),
+        }
+        if not dry_run:
+            close_stream_writers(handles)
+            handles = {}
+            write_json_file(path_under(tmp_root, "reports/%s.stats.json" % date), stats)
+            write_json_file(path_under(tmp_root, "manifests/%s.manifest.json" % date), manifest)
+            commit_tmp_outputs(output_root_path, date, output_relative_paths(date))
+        return manifest
+    except Exception:
+        if handles:
+            close_stream_writers(handles)
+        if tmp_root is not None:
+            cleanup_path(tmp_root)
+            cleanup_path(path_under(output_root_path, ".tmp/%s.backup" % date))
+        raise

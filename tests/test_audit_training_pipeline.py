@@ -1078,9 +1078,6 @@ class LabelModelTest(unittest.TestCase):
                 self.assertEqual(error, "labeler_invalid_response")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PipelineRunTest(unittest.TestCase):
     def test_process_date_writes_expected_outputs(self):
@@ -1255,3 +1252,110 @@ class PipelineRunTest(unittest.TestCase):
             self.assertEqual(result["rejected"], 1)
             self.assertEqual(result["files_loaded"], 0)
             self.assertEqual(result["files_attempted"], 1)
+
+
+    def test_write_outputs_atomically_rolls_back_when_replace_fails(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            old_canonical = output_root / "canonical" / "2026-07-15.jsonl"
+            old_stats = output_root / "reports" / "2026-07-15.stats.json"
+            old_canonical.parent.mkdir(parents=True)
+            old_stats.parent.mkdir(parents=True)
+            old_canonical.write_text('{"old":"canonical"}\n', encoding="utf-8")
+            old_stats.write_text('{"old":"stats"}', encoding="utf-8")
+            outputs = {
+                "canonical/2026-07-15.jsonl": [{"new": "canonical"}],
+                "reports/2026-07-15.stats.json": {"new": "stats"},
+            }
+            original_replace = pipeline.os.replace
+            calls = []
+
+            def fail_second_replace(src, dst):
+                calls.append((src, dst))
+                if len(calls) == 2:
+                    raise OSError("injected replace failure")
+                original_replace(src, dst)
+
+            pipeline.os.replace = fail_second_replace
+            try:
+                with self.assertRaises(OSError):
+                    pipeline.write_outputs_atomically(str(output_root), "2026-07-15", outputs)
+            finally:
+                pipeline.os.replace = original_replace
+
+            self.assertEqual(old_canonical.read_text(encoding="utf-8"), '{"old":"canonical"}\n')
+            self.assertEqual(old_stats.read_text(encoding="utf-8"), '{"old":"stats"}')
+            self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
+            self.assertFalse((output_root / ".tmp" / "2026-07-15.backup").exists())
+
+    def test_write_outputs_rejects_non_standard_json_without_touching_old_final(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            old_path = output_root / "canonical" / "2026-07-15.jsonl"
+            old_path.parent.mkdir(parents=True)
+            old_path.write_text('{"old":true}\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                pipeline.write_outputs_atomically(
+                    str(output_root),
+                    "2026-07-15",
+                    {"canonical/2026-07-15.jsonl": [{"value": float("nan")}]},
+                )
+            self.assertEqual(old_path.read_text(encoding="utf-8"), '{"old":true}\n')
+
+    def test_write_outputs_rejects_unsafe_relative_paths(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            with self.assertRaises(ValueError):
+                pipeline.write_outputs_atomically(
+                    str(output_root),
+                    "2026-07-15",
+                    {"../escape.jsonl": [{"bad": True}]},
+                )
+            self.assertFalse((pathlib.Path(tmp) / "escape.jsonl").exists())
+
+    def test_process_date_rejects_unsafe_detail_path_without_reading_outside_root(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(root / "secret.json", sample_success_record())
+            day.mkdir(parents=True)
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "escape", "file_path": "../secret.json"}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", dry_run=True)
+
+            self.assertEqual(result["accepted"], 0)
+            self.assertEqual(result["rejected"], 1)
+            self.assertEqual(result["files_attempted"], 1)
+            self.assertEqual(result["reject_reasons"], {"unsafe_detail_path": 1})
+
+    def test_process_date_rejects_invalid_dates_before_writing(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            for bad_date in ["../2026-07-15", "2026-7-15"]:
+                with self.subTest(date=bad_date):
+                    with self.assertRaises(ValueError):
+                        pipeline.process_date(str(input_root), str(output_root), bad_date)
+            self.assertFalse((root / "2026-07-15").exists())
+            self.assertFalse(output_root.exists())
+
+    def test_main_guard_stays_after_pipeline_run_tests(self):
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        self.assertGreater(
+            source.rfind('if __name__ == "__main__":'),
+            source.rfind("class PipelineRunTest"),
+        )
+
+if __name__ == "__main__":
+    unittest.main()
