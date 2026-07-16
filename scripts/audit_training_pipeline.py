@@ -719,14 +719,16 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
     rejects = []
     label_queue = []
     index_record_count = 0
+    files_attempted = 0
     files_loaded = 0
     for index_record, index_error in iter_index_records(input_root, date):
         if index_error is not None:
             rejects.append(index_error)
             continue
         index_record_count += 1
-        if limit is not None and files_loaded >= limit:
+        if limit is not None and files_attempted >= limit:
             break
+        files_attempted += 1
         raw, error = load_audit_record(input_root, index_record)
         if error:
             rejects.append(error)
@@ -744,6 +746,7 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
         "input_root": str(input_root),
         "output_root": str(output_root),
         "index_records": index_record_count,
+        "files_attempted": files_attempted,
         "files_loaded": files_loaded,
         "accepted": len(canonical_records),
         "rejected": len(rejects),

@@ -1234,3 +1234,24 @@ class PipelineRunTest(unittest.TestCase):
             self.assertEqual(result["accepted"], 1)
             self.assertEqual(result["rejected"], 1)
             self.assertEqual(result["files_loaded"], 1)
+
+    def test_process_date_limit_counts_missing_detail_attempt(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "002.json", sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "missing", "file_path": "2026-07-15/u/s/missing.json"}) + "\n"
+                + json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/002.json"}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", limit=1, dry_run=True)
+
+            self.assertEqual(result["accepted"], 0)
+            self.assertEqual(result["rejected"], 1)
+            self.assertEqual(result["files_loaded"], 0)
+            self.assertEqual(result["files_attempted"], 1)
