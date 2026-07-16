@@ -221,18 +221,21 @@ def sanitize_usage(usage):
         if key not in usage:
             continue
         value = usage[key]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
+        if isinstance(value, bool):
             return None
-        if isinstance(value, float):
-            if not value.is_integer():
+        if isinstance(value, int):
+            if value < 0 or value > MAX_USAGE_TOKENS:
+                return None
+        elif isinstance(value, float):
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or not value.is_integer()
+                or value > MAX_USAGE_TOKENS
+            ):
                 return None
             value = int(value)
-        if value > MAX_USAGE_TOKENS:
+        else:
             return None
         sanitized[key] = value
     return sanitized

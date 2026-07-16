@@ -858,12 +858,10 @@ class LabelModelTest(unittest.TestCase):
             "AUDIT_LABEL_API_KEY": "key",
             "AUDIT_LABEL_MODEL": "label-model",
             "AUDIT_LABEL_TIMEOUT": "12",
-            "AUDIT_LABEL_MAX_CONCURRENCY": "3",
         }
         config = pipeline.load_label_config(env)
         self.assertTrue(config["enabled"])
         self.assertEqual(config["timeout"], 12)
-        self.assertEqual(config["max_concurrency"], 3)
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -891,14 +889,12 @@ def load_label_config(env=None):
     api_key = source.get("AUDIT_LABEL_API_KEY", "")
     model = source.get("AUDIT_LABEL_MODEL", "")
     timeout = int(source.get("AUDIT_LABEL_TIMEOUT", "30"))
-    max_concurrency = int(source.get("AUDIT_LABEL_MAX_CONCURRENCY", "1"))
     return {
         "enabled": bool(base_url and api_key and model),
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
         "timeout": timeout,
-        "max_concurrency": max(1, max_concurrency),
     }
 
 
@@ -1294,7 +1290,6 @@ AUDIT_LABEL_BASE_URL
 AUDIT_LABEL_API_KEY
 AUDIT_LABEL_MODEL
 AUDIT_LABEL_TIMEOUT
-AUDIT_LABEL_MAX_CONCURRENCY
 ```
 ````
 

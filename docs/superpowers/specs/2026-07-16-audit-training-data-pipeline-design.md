@@ -262,7 +262,6 @@ AUDIT_LABEL_BASE_URL
 AUDIT_LABEL_API_KEY
 AUDIT_LABEL_MODEL
 AUDIT_LABEL_TIMEOUT
-AUDIT_LABEL_MAX_CONCURRENCY
 ```
 
 The interface is OpenAI-compatible. When configured, the script may label low-confidence router samples or a configured sample subset.

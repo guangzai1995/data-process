@@ -638,6 +638,11 @@ class CanonicalBuildTest(unittest.TestCase):
                 self.assertIsNone(canonical)
                 self.assertEqual(reject["reason"], "invalid_usage")
 
+    def test_sanitize_usage_rejects_oversized_int_without_overflow(self):
+        pipeline = load_pipeline_module()
+        self.assertIsNone(pipeline.sanitize_usage({"prompt_tokens": 10 ** 10000}))
+        self.assertIsNone(pipeline.sanitize_usage({"prompt_tokens": -(10 ** 10000)}))
+
     def test_build_canonical_sample_keeps_only_sanitized_usage_token_fields(self):
         pipeline = load_pipeline_module()
         raw = sample_success_record()
