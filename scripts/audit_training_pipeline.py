@@ -1036,12 +1036,24 @@ def yesterday_date():
 def date_range(start_date, end_date):
     start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
     end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+    if start > end:
+        raise ValueError("start_date must be before or equal to end_date")
     current = start
     dates = []
     while current <= end:
         dates.append(current.isoformat())
         current += datetime.timedelta(days=1)
     return dates
+
+
+def non_negative_int(value):
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return parsed
 
 
 def parse_args(argv):
@@ -1054,23 +1066,32 @@ def parse_args(argv):
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--yesterday", action="store_true")
-    parser.add_argument("--limit", type=int)
+    parser.add_argument("--limit", type=non_negative_int)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
 def resolve_dates(args):
+    has_range = bool(args.start_date or args.end_date)
+    selector_count = sum([bool(args.yesterday), bool(args.date), has_range])
+    if selector_count != 1:
+        raise SystemExit(
+            "Provide exactly one of --yesterday, --date, or --start-date with --end-date"
+        )
     if args.yesterday:
         return [yesterday_date()]
     if args.date:
         return [args.date]
-    if args.start_date and args.end_date:
+    if not (args.start_date and args.end_date):
+        raise SystemExit("Provide --start-date with --end-date")
+    try:
         return date_range(args.start_date, args.end_date)
-    raise SystemExit("Provide --yesterday, --date, or --start-date with --end-date")
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
 def main(argv=None):
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     results = []
     for date in resolve_dates(args):
         result = process_date(
@@ -1081,7 +1102,7 @@ def main(argv=None):
             dry_run=args.dry_run,
         )
         results.append(result)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
 
 

@@ -2,7 +2,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import pathlib
+import sys
 import tempfile
 import unittest
 
@@ -96,6 +98,54 @@ class CliTest(unittest.TestCase):
                 {"accepted": 1, "date": "2026-07-02"},
             ],
         )
+
+    def test_main_empty_argv_does_not_fall_back_to_sys_argv(self):
+        pipeline = load_pipeline_module()
+        calls = []
+
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+            calls.append(date)
+            return {"date": date}
+
+        pipeline.process_date = fake_process_date
+        original_argv = sys.argv
+        sys.argv = ["audit_training_pipeline.py", "--date", "2099-01-01"]
+        try:
+            with self.assertRaises(SystemExit):
+                pipeline.main([])
+        finally:
+            sys.argv = original_argv
+        self.assertEqual(calls, [])
+
+    def test_resolve_dates_rejects_conflicting_selectors(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args(["--date", "2026-07-01", "--yesterday"])
+        with self.assertRaises(SystemExit):
+            pipeline.resolve_dates(args)
+
+    def test_resolve_dates_rejects_reversed_range(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args(
+            ["--start-date", "2026-07-03", "--end-date", "2026-07-01"]
+        )
+        with self.assertRaises(SystemExit):
+            pipeline.resolve_dates(args)
+
+    def test_parse_args_rejects_negative_limit(self):
+        pipeline = load_pipeline_module()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                pipeline.parse_args(["--date", "2026-07-01", "--limit", "-1"])
+
+    def test_main_rejects_non_standard_json_stdout(self):
+        pipeline = load_pipeline_module()
+
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+            return {"date": date, "score": math.nan}
+
+        pipeline.process_date = fake_process_date
+        with self.assertRaises(ValueError):
+            pipeline.main(["--date", "2026-07-01"])
 
 
 class RedactionTest(unittest.TestCase):
