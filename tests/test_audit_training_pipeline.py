@@ -282,6 +282,30 @@ class CanonicalBuildTest(unittest.TestCase):
         self.assertIsNone(canonical)
         self.assertEqual(reject["reason"], "missing_choices")
 
+    def test_build_canonical_sample_rejects_empty_choices(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"] = []
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "missing_choices")
+
+    def test_build_canonical_sample_rejects_non_dict_first_choice(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"] = ["not-a-dict"]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "missing_choices")
+
     def test_build_canonical_sample_rejects_non_dict_request_body(self):
         pipeline = load_pipeline_module()
         raw = sample_success_record()
