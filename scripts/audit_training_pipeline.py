@@ -376,19 +376,25 @@ def classify_by_rules(canonical):
     return "general_chat"
 
 
+def normalize_model_label(model_label):
+    if not isinstance(model_label, dict):
+        return None
+    label = model_label.get("label")
+    confidence = model_label.get("confidence")
+    if (
+        isinstance(label, str)
+        and label in ROUTE_LABELS
+        and isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+    ):
+        return {"label": label, "confidence": float(confidence)}
+    return None
+
+
 def final_route_label(canonical):
-    model_label = canonical["routing"].get("model_label")
-    if isinstance(model_label, dict):
-        label = model_label.get("label")
-        confidence = model_label.get("confidence")
-        if (
-            isinstance(label, str)
-            and label in ROUTE_LABELS
-            and isinstance(confidence, (int, float))
-            and not isinstance(confidence, bool)
-            and confidence >= 0.75
-        ):
-            return label, "high"
+    model_label = normalize_model_label(canonical["routing"].get("model_label"))
+    if model_label and model_label["confidence"] >= 0.75:
+        return model_label["label"], "high"
     rule_label = classify_by_rules(canonical)
     if rule_label in ROUTE_LABELS:
         return rule_label, "medium"
@@ -452,7 +458,7 @@ def export_router(canonical):
         "labels": {
             "weak_model_label": canonical["routing"].get("weak_model_label"),
             "rule_label": rule_label,
-            "model_label": canonical["routing"].get("model_label"),
+            "model_label": normalize_model_label(canonical["routing"].get("model_label")),
             "final_label": final_label,
             "confidence": confidence,
         },

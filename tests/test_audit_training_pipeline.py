@@ -676,6 +676,67 @@ class ExporterTest(unittest.TestCase):
         router = pipeline.export_router(canonical)
         self.assertEqual(router["labels"]["final_label"], "code_generation")
         self.assertEqual(router["labels"]["confidence"], "medium")
+        self.assertIsNone(router["labels"]["model_label"])
+
+    def test_export_router_sanitizes_malformed_model_label_payload(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["routing"]["model_label"] = {
+            "label": [],
+            "confidence": 0.9,
+            "debug": "raw prompt secret@example.com",
+        }
+        router = pipeline.export_router(canonical)
+        dumped = json.dumps(router, ensure_ascii=False)
+        self.assertIsNone(router["labels"]["model_label"])
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+        self.assertNotIn("debug", dumped)
+        self.assertNotIn("raw prompt", dumped)
+        self.assertNotIn("secret@example.com", dumped)
+
+    def test_export_router_uses_sanitized_high_confidence_model_label(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["routing"]["model_label"] = {
+            "label": "tool_agent",
+            "confidence": 0.75,
+            "reason": "debug reason should stay out",
+        }
+        router = pipeline.export_router(canonical)
+        self.assertEqual(router["labels"]["final_label"], "tool_agent")
+        self.assertEqual(router["labels"]["confidence"], "high")
+        self.assertEqual(
+            router["labels"]["model_label"],
+            {"label": "tool_agent", "confidence": 0.75},
+        )
+        self.assertNotIn("reason", json.dumps(router, ensure_ascii=False))
+
+    def test_export_router_preserves_sanitized_low_confidence_model_label(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": 0.74}
+        router = pipeline.export_router(canonical)
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+        self.assertEqual(router["labels"]["confidence"], "medium")
+        self.assertEqual(
+            router["labels"]["model_label"],
+            {"label": "tool_agent", "confidence": 0.74},
+        )
 
 
 if __name__ == "__main__":
