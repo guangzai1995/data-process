@@ -122,5 +122,80 @@ class AuditReadTest(unittest.TestCase):
             self.assertEqual(loaded["request_id"], "r1")
 
 
+
+def sample_success_record():
+    return {
+        "timestamp": "2026-07-15T00:00:00+08:00",
+        "user_id": "user-1",
+        "tenant_id": "tenant-1",
+        "api_key_id": "key-1",
+        "session_id": "session-1",
+        "client_ip": "10.1.2.3",
+        "request_id": "request-1",
+        "request_path": "/api/v1/openai/v1/chat/completions",
+        "model": "glm-5.2",
+        "client_type": "opencode",
+        "status": "success",
+        "request_body": {
+            "model": "glm-5.2",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "请写一段 Python 代码，联系 13800138000"}
+            ],
+            "temperature": 0.3,
+        },
+        "response_body": {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "可以使用 print('hello')"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+    }
+
+
+class CanonicalBuildTest(unittest.TestCase):
+    def test_build_canonical_sample_accepts_success_record(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        self.assertEqual(canonical["source"]["date"], "2026-07-15")
+        self.assertEqual(canonical["routing"]["weak_model_label"], "glm-5.2")
+        self.assertEqual(canonical["quality"]["status"], "accepted")
+        self.assertIn("<PHONE_1>", canonical["request"]["messages"][0]["content"])
+        self.assertNotIn("tenant-1", json.dumps(canonical, ensure_ascii=False))
+        self.assertIn("router", canonical["quality"]["task_types"])
+
+    def test_build_canonical_sample_rejects_failed_record(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["status"] = "failed"
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "status_not_success")
+
+    def test_build_canonical_sample_rejects_empty_assistant_response(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["response_body"]["choices"][0]["message"]["content"] = ""
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(reject["reason"], "empty_assistant_response")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -91,3 +91,155 @@ def load_audit_record(input_root, index_record):
             "file_path": index_record.get("file_path"),
             "reason": "bad_detail_json",
         }
+
+
+
+def stable_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def content_hash(value):
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def redact_value_tree(value):
+    if isinstance(value, str):
+        redacted, stats = redact_text(value)
+        return redacted, stats
+    if isinstance(value, list):
+        redacted_items = []
+        merged = {}
+        for item in value:
+            redacted, stats = redact_value_tree(item)
+            redacted_items.append(redacted)
+            for key, count in stats.items():
+                merged[key] = merged.get(key, 0) + count
+        return redacted_items, merged
+    if isinstance(value, dict):
+        redacted_dict = {}
+        merged = {}
+        for key, item in value.items():
+            redacted, stats = redact_value_tree(item)
+            redacted_dict[key] = redacted
+            for stat_key, count in stats.items():
+                merged[stat_key] = merged.get(stat_key, 0) + count
+        return redacted_dict, merged
+    return value, {}
+
+
+def first_response_choice(raw_record):
+    choices = (raw_record.get("response_body") or {}).get("choices") or []
+    if not choices:
+        return None
+    return choices[0]
+
+
+def assistant_text_from_choice(choice):
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def merge_counts(*dicts):
+    merged = {}
+    for counts in dicts:
+        for key, value in counts.items():
+            merged[key] = merged.get(key, 0) + value
+    return merged
+
+
+def reject_record(date, index_record, reason):
+    return {
+        "date": date,
+        "request_id": index_record.get("request_id"),
+        "file_path": index_record.get("file_path"),
+        "reason": reason,
+    }
+
+
+def build_request_params(request_body, raw_record):
+    excluded = set(["messages", "tools"])
+    params = {key: value for key, value in request_body.items() if key not in excluded}
+    params["client_type"] = raw_record.get("client_type") or ""
+    params["adapter_type"] = raw_record.get("adapter_type") or ""
+    params["is_stream"] = bool(raw_record.get("is_stream"))
+    return params
+
+
+def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=200000, max_response_chars=100000):
+    if raw_record.get("status") != "success":
+        return None, reject_record(date, index_record, "status_not_success")
+    request_body = raw_record.get("request_body") or {}
+    messages = request_body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None, reject_record(date, index_record, "missing_messages")
+    choice = first_response_choice(raw_record)
+    if choice is None:
+        return None, reject_record(date, index_record, "missing_choices")
+    response_text = assistant_text_from_choice(choice)
+    if not response_text and not ((choice.get("message") or {}).get("tool_calls")):
+        return None, reject_record(date, index_record, "empty_assistant_response")
+    if len(stable_json(messages)) > max_prompt_chars:
+        return None, reject_record(date, index_record, "prompt_too_long")
+    if len(response_text) > max_response_chars:
+        return None, reject_record(date, index_record, "response_too_long")
+
+    redacted_messages, message_stats = redact_value_tree(messages)
+    redacted_tools, tool_stats = redact_value_tree(request_body.get("tools") or [])
+    redacted_response, response_stats = redact_value_tree(choice.get("message") or {})
+    stats = merge_counts(message_stats, tool_stats, response_stats)
+    request_payload_for_hash = {
+        "date": date,
+        "request_id": raw_record.get("request_id") or index_record.get("request_id"),
+        "messages": redacted_messages,
+    }
+    sample_id = hashlib.sha256(stable_json(request_payload_for_hash).encode("utf-8")).hexdigest()
+    finish_reason = choice.get("finish_reason")
+    task_types = ["router"]
+    if redacted_tools or redacted_response.get("tool_calls"):
+        task_types.append("tool_use_sft")
+    elif finish_reason != "length":
+        task_types.append("sft")
+
+    canonical = {
+        "sample_id": sample_id,
+        "source": {
+            "date": date,
+            "request_id": raw_record.get("request_id") or index_record.get("request_id"),
+            "file_path": index_record.get("file_path"),
+            "tenant_hash": hash_identifier(raw_record.get("tenant_id")),
+            "user_hash": hash_identifier(raw_record.get("user_id")),
+            "session_hash": hash_identifier(raw_record.get("session_id")),
+        },
+        "request": {
+            "model": raw_record.get("model") or request_body.get("model"),
+            "request_path": raw_record.get("request_path"),
+            "messages": redacted_messages,
+            "tools": redacted_tools,
+            "tool_choice": request_body.get("tool_choice"),
+            "params": build_request_params(request_body, raw_record),
+        },
+        "response": {
+            "message": redacted_response,
+            "finish_reason": finish_reason,
+            "usage": (raw_record.get("response_body") or {}).get("usage") or {},
+        },
+        "routing": {
+            "weak_model_label": raw_record.get("model") or request_body.get("model"),
+            "weak_expert_label": choice.get("routed_experts"),
+            "rule_label": None,
+            "model_label": None,
+            "label_confidence": "weak",
+        },
+        "quality": {
+            "status": "accepted",
+            "task_types": task_types,
+            "reject_reasons": [],
+            "pii_redacted": bool(sum(stats.values())),
+            "redaction_stats": stats,
+            "content_hash": content_hash({"messages": redacted_messages, "response": redacted_response}),
+        },
+    }
+    return canonical, None
