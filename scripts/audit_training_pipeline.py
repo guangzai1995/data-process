@@ -6,6 +6,7 @@ DEFAULT_INPUT_ROOT = "/isos_data_share/audit"
 DEFAULT_OUTPUT_ROOT = "audit_training"
 
 
+import argparse
 import datetime
 import hashlib
 import json
@@ -14,6 +15,7 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 import urllib.request
 
 
@@ -1025,3 +1027,63 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
             if backup_root is not None and not is_rollback_failed_error(exc):
                 cleanup_tmp_root(backup_root, output_root_path)
         raise
+
+
+def yesterday_date():
+    return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+
+def date_range(start_date, end_date):
+    start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+    current = start
+    dates = []
+    while current <= end:
+        dates.append(current.isoformat())
+        current += datetime.timedelta(days=1)
+    return dates
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Clean audit logs into training-ready datasets."
+    )
+    parser.add_argument("--input-root", default=DEFAULT_INPUT_ROOT)
+    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--date")
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    parser.add_argument("--yesterday", action="store_true")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args(argv)
+
+
+def resolve_dates(args):
+    if args.yesterday:
+        return [yesterday_date()]
+    if args.date:
+        return [args.date]
+    if args.start_date and args.end_date:
+        return date_range(args.start_date, args.end_date)
+    raise SystemExit("Provide --yesterday, --date, or --start-date with --end-date")
+
+
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
+    results = []
+    for date in resolve_dates(args):
+        result = process_date(
+            args.input_root,
+            args.output_root,
+            date,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+        results.append(result)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

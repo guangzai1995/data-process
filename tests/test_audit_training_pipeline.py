@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -20,6 +22,80 @@ class PipelineImportTest(unittest.TestCase):
     def test_pipeline_version_is_declared(self):
         pipeline = load_pipeline_module()
         self.assertEqual(pipeline.PIPELINE_VERSION, "2026.07.16")
+
+
+class CliTest(unittest.TestCase):
+    def test_date_range_returns_inclusive_dates(self):
+        pipeline = load_pipeline_module()
+        self.assertEqual(
+            pipeline.date_range("2026-07-01", "2026-07-03"),
+            ["2026-07-01", "2026-07-02", "2026-07-03"],
+        )
+
+    def test_resolve_dates_accepts_single_date(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args(["--date", "2026-07-15"])
+        self.assertEqual(pipeline.resolve_dates(args), ["2026-07-15"])
+
+    def test_resolve_dates_accepts_inclusive_start_and_end(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args(
+            ["--start-date", "2026-07-01", "--end-date", "2026-07-03"]
+        )
+        self.assertEqual(
+            pipeline.resolve_dates(args),
+            ["2026-07-01", "2026-07-02", "2026-07-03"],
+        )
+
+    def test_resolve_dates_requires_date_selector(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args([])
+        with self.assertRaises(SystemExit):
+            pipeline.resolve_dates(args)
+
+    def test_main_processes_each_date_and_prints_json_lines(self):
+        pipeline = load_pipeline_module()
+        calls = []
+
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+            calls.append((input_root, output_root, date, limit, dry_run))
+            return {"date": date, "accepted": 1}
+
+        pipeline.process_date = fake_process_date
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = pipeline.main(
+                [
+                    "--input-root",
+                    "in",
+                    "--output-root",
+                    "out",
+                    "--start-date",
+                    "2026-07-01",
+                    "--end-date",
+                    "2026-07-02",
+                    "--limit",
+                    "5",
+                    "--dry-run",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                ("in", "out", "2026-07-01", 5, True),
+                ("in", "out", "2026-07-02", 5, True),
+            ],
+        )
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(
+            [json.loads(line) for line in lines],
+            [
+                {"accepted": 1, "date": "2026-07-01"},
+                {"accepted": 1, "date": "2026-07-02"},
+            ],
+        )
 
 
 class RedactionTest(unittest.TestCase):
