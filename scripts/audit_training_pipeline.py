@@ -790,16 +790,12 @@ def prepare_tmp_roots(output_root, date):
     return output_root, tmp_root, backup_root
 
 
-def cleanup_path(path):
-    if path.exists():
-        if path.is_dir():
-            shutil.rmtree(str(path))
-        else:
-            path.unlink()
-
-
 def cleanup_tmp_root(path, output_root):
     safe_remove_tree_leaf(path, output_root)
+
+
+def is_rollback_failed_error(exc):
+    return "rollback_failed" in str(exc)
 
 
 def rollback_replacements(created_finals, backups):
@@ -818,6 +814,7 @@ def commit_tmp_outputs(output_root, date, relative_paths):
     backup_root = lexical_path_under(output_root, ".tmp/%s.backup" % date)
     backups = []
     created_finals = []
+    preserve_backup = False
     try:
         for relative in relative_paths:
             final = path_under(output_root, relative)
@@ -831,17 +828,26 @@ def commit_tmp_outputs(output_root, date, relative_paths):
             else:
                 created_finals.append(final)
             os.replace(str(temp_file), str(final))
-    except Exception:
-        rollback_replacements(created_finals, backups)
+    except Exception as commit_error:
+        try:
+            rollback_replacements(created_finals, backups)
+        except Exception as rollback_error:
+            preserve_backup = True
+            raise RuntimeError(
+                "rollback_failed: %s; original_error: %s"
+                % (rollback_error, commit_error)
+            )
         raise
     finally:
         cleanup_tmp_root(tmp_root, output_root)
-        cleanup_tmp_root(backup_root, output_root)
+        if not preserve_backup:
+            cleanup_tmp_root(backup_root, output_root)
 
 
 def write_outputs_atomically(output_root, date, outputs):
     output_root, tmp_root, backup_root = prepare_tmp_roots(output_root, date)
     relative_paths = []
+    commit_started = False
     try:
         for relative, value in outputs.items():
             validate_relative_path(relative)
@@ -851,10 +857,14 @@ def write_outputs_atomically(output_root, date, outputs):
                 write_jsonl(target, value)
             else:
                 write_json_file(target, value)
+        commit_started = True
         commit_tmp_outputs(output_root, date, relative_paths)
-    except Exception:
-        cleanup_tmp_root(tmp_root, output_root)
-        cleanup_tmp_root(backup_root, output_root)
+    except Exception as exc:
+        if not commit_started:
+            cleanup_tmp_root(tmp_root, output_root)
+            cleanup_tmp_root(backup_root, output_root)
+        elif not is_rollback_failed_error(exc):
+            cleanup_tmp_root(backup_root, output_root)
         raise
 
 
@@ -950,6 +960,7 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
     index_record_count = 0
     files_attempted = 0
     files_loaded = 0
+    commit_started = False
     try:
         if not dry_run:
             output_root_path, tmp_root, backup_root = prepare_tmp_roots(output_root_path, date)
@@ -1001,15 +1012,16 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
             handles = {}
             write_json_file(path_under(tmp_root, "reports/%s.stats.json" % date), stats)
             write_json_file(path_under(tmp_root, "manifests/%s.manifest.json" % date), manifest)
+            commit_started = True
             commit_tmp_outputs(output_root_path, date, output_relative_paths(date))
         return manifest
-    except Exception:
+    except Exception as exc:
         try:
             if handles:
                 close_stream_writers(handles)
         finally:
-            if tmp_root is not None:
+            if tmp_root is not None and not commit_started:
                 cleanup_tmp_root(tmp_root, output_root_path)
-            if backup_root is not None:
+            if backup_root is not None and not is_rollback_failed_error(exc):
                 cleanup_tmp_root(backup_root, output_root_path)
         raise

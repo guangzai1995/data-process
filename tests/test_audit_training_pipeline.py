@@ -1433,6 +1433,39 @@ class PipelineRunTest(unittest.TestCase):
             self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
             self.assertFalse((output_root / ".tmp" / "2026-07-15.backup").exists())
 
+
+    def test_write_outputs_preserves_backup_when_rollback_restore_fails(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            old_final = output_root / "canonical" / "2026-07-15.jsonl"
+            old_final.parent.mkdir(parents=True)
+            old_final.write_text('old-canonical\n', encoding="utf-8")
+            outputs = {
+                "canonical/2026-07-15.jsonl": [{"new": "canonical"}],
+            }
+            original_replace = pipeline.os.replace
+            calls = []
+
+            def fail_forward_and_rollback(src, dst):
+                calls.append((src, dst))
+                if len(calls) in (2, 3):
+                    raise OSError("injected replace failure")
+                original_replace(src, dst)
+
+            pipeline.os.replace = fail_forward_and_rollback
+            try:
+                with self.assertRaises(RuntimeError) as context:
+                    pipeline.write_outputs_atomically(str(output_root), "2026-07-15", outputs)
+            finally:
+                pipeline.os.replace = original_replace
+
+            self.assertIn("rollback_failed", str(context.exception))
+            backup = output_root / ".tmp" / "2026-07-15.backup" / "canonical" / "2026-07-15.jsonl"
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.read_text(encoding="utf-8"), 'old-canonical\n')
+            self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
+
     def test_main_guard_stays_after_pipeline_run_tests(self):
         source = pathlib.Path(__file__).read_text(encoding="utf-8")
         self.assertGreater(
