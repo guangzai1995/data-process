@@ -381,7 +381,13 @@ def final_route_label(canonical):
     if isinstance(model_label, dict):
         label = model_label.get("label")
         confidence = model_label.get("confidence")
-        if label in ROUTE_LABELS and isinstance(confidence, (int, float)) and confidence >= 0.75:
+        if (
+            isinstance(label, str)
+            and label in ROUTE_LABELS
+            and isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and confidence >= 0.75
+        ):
             return label, "high"
     rule_label = classify_by_rules(canonical)
     if rule_label in ROUTE_LABELS:

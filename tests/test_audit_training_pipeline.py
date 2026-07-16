@@ -653,6 +653,29 @@ class ExporterTest(unittest.TestCase):
         canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": None}
         router = pipeline.export_router(canonical)
         self.assertEqual(router["labels"]["final_label"], "code_generation")
+        self.assertEqual(router["labels"]["confidence"], "medium")
+
+    def test_export_router_ignores_malformed_model_label_types(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        for bad_label in ([], {}):
+            with self.subTest(label=bad_label):
+                canonical["routing"]["model_label"] = {
+                    "label": bad_label,
+                    "confidence": 0.9,
+                }
+                router = pipeline.export_router(canonical)
+                self.assertEqual(router["labels"]["final_label"], "code_generation")
+                self.assertEqual(router["labels"]["confidence"], "medium")
+        canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": True}
+        router = pipeline.export_router(canonical)
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+        self.assertEqual(router["labels"]["confidence"], "medium")
 
 
 if __name__ == "__main__":
