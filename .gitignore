@@ -1,0 +1,21 @@
+# Ignore raw datasets and generated training outputs by default.
+*
+
+# Repository metadata and documentation.
+!.gitignore
+!README.md
+!docs/
+!docs/**
+
+# Processing code, configs, and tests.
+!scripts/
+!scripts/**
+!configs/
+!configs/**
+!tests/
+!tests/**
+
+# Keep only lightweight audit-training docs unless explicitly forced.
+!audit_training/
+audit_training/*
+!audit_training/README.md
