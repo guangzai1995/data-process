@@ -8,6 +8,7 @@ DEFAULT_OUTPUT_ROOT = "audit_training"
 
 import hashlib
 import json
+import math
 import pathlib
 import re
 
@@ -346,9 +347,31 @@ def extract_text_content(content):
 
 def last_user_content(messages):
     for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
         if message.get("role") == "user":
             return extract_text_content(message.get("content"))
     return ""
+
+
+def export_text_messages(messages):
+    exported = []
+    has_user_text = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if not isinstance(role, str):
+            continue
+        content = extract_text_content(message.get("content"))
+        if not content:
+            continue
+        if role == "user":
+            has_user_text = True
+        exported.append({"role": role, "content": content})
+    if not has_user_text:
+        return None
+    return exported
 
 
 def has_tool_interaction(canonical):
@@ -381,14 +404,17 @@ def normalize_model_label(model_label):
         return None
     label = model_label.get("label")
     confidence = model_label.get("confidence")
-    if (
+    if not (
         isinstance(label, str)
         and label in ROUTE_LABELS
         and isinstance(confidence, (int, float))
         and not isinstance(confidence, bool)
     ):
-        return {"label": label, "confidence": float(confidence)}
-    return None
+        return None
+    confidence = float(confidence)
+    if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
+        return None
+    return {"label": label, "confidence": confidence}
 
 
 def final_route_label(canonical):
@@ -404,8 +430,10 @@ def final_route_label(canonical):
 def export_sft(canonical):
     message = canonical["response"]["message"]
     content = extract_text_content(message.get("content"))
+    request_messages = export_text_messages(canonical["request"]["messages"])
     if (
         not content
+        or request_messages is None
         or has_tool_interaction(canonical)
         or canonical["response"].get("finish_reason") == "length"
     ):
@@ -415,7 +443,7 @@ def export_sft(canonical):
         "instruction": "",
         "input": last_user_content(canonical["request"]["messages"]),
         "output": content,
-        "messages": canonical["request"]["messages"] + [{"role": "assistant", "content": content}],
+        "messages": request_messages + [{"role": "assistant", "content": content}],
         "metadata": {
             "source_date": canonical["source"]["date"],
             "model": canonical["request"].get("model"),

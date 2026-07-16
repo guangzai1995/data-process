@@ -739,5 +739,94 @@ class ExporterTest(unittest.TestCase):
         )
 
 
+    def test_export_sft_rebuilds_messages_as_text_only(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["messages"] = [
+            {
+                "role": "system",
+                "content": {"debug": "do not export"},
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请写 Python 代码"},
+                    {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+                ],
+            },
+        ]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        exported = pipeline.export_sft(canonical)
+        dumped = json.dumps(exported, ensure_ascii=False)
+        self.assertEqual(
+            exported["messages"],
+            [
+                {"role": "user", "content": "请写 Python 代码"},
+                {"role": "assistant", "content": "可以使用 print('hello')"},
+            ],
+        )
+        self.assertNotIn("image_url", dumped)
+        self.assertNotIn("debug", dumped)
+        for message in exported["messages"]:
+            self.assertIsInstance(message["content"], str)
+
+    def test_export_sft_skips_when_no_user_text_message(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["request"]["messages"] = [
+            {"role": "user", "content": {"prompt": "do not repr"}}
+        ]
+        self.assertIsNone(pipeline.export_sft(canonical))
+
+    def test_export_router_rejects_non_finite_or_out_of_range_model_confidence(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        for confidence in (float("nan"), float("inf"), -0.1, 1.5):
+            with self.subTest(confidence=confidence):
+                canonical["routing"]["model_label"] = {
+                    "label": "tool_agent",
+                    "confidence": confidence,
+                }
+                router = pipeline.export_router(canonical)
+                self.assertIsNone(router["labels"]["model_label"])
+                self.assertEqual(router["labels"]["final_label"], "code_generation")
+                self.assertEqual(router["labels"]["confidence"], "medium")
+
+    def test_exporters_skip_non_dict_messages(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["request"]["messages"] = [
+            {"role": "user", "content": "请写 Python 代码"},
+            "bad-message",
+            None,
+        ]
+        self.assertEqual(pipeline.classify_by_rules(canonical), "code_generation")
+        router = pipeline.export_router(canonical)
+        sft = pipeline.export_sft(canonical)
+        self.assertEqual(router["input"], "请写 Python 代码")
+        self.assertEqual(sft["input"], "请写 Python 代码")
+        self.assertEqual(sft["messages"][0], {"role": "user", "content": "请写 Python 代码"})
+
+
 if __name__ == "__main__":
     unittest.main()
