@@ -63,7 +63,11 @@ def iter_index_records(input_root, date):
             except ValueError:
                 yield None, {"line": line_number, "reason": "bad_index_json"}
                 continue
-            if not record.get("request_id") or not record.get("file_path"):
+            if (
+                not isinstance(record, dict)
+                or not record.get("request_id")
+                or not record.get("file_path")
+            ):
                 yield None, {"line": line_number, "reason": "bad_index_record"}
                 continue
             yield record, None
@@ -87,4 +91,3 @@ def load_audit_record(input_root, index_record):
             "file_path": index_record.get("file_path"),
             "reason": "bad_detail_json",
         }
-

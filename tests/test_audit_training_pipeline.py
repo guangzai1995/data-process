@@ -86,6 +86,7 @@ class AuditReadTest(unittest.TestCase):
                 "\n"
                 "{\"request_id\":\"r1\",\"file_path\":\"2026-07-15/u/s/001.json\"}\n"
                 "{bad json}\n"
+                "[]\n"
                 "{\"request_id\":\"r2\",\"file_path\":\"2026-07-15/u/s/002.json\"}\n",
                 encoding="utf-8",
             )
@@ -93,7 +94,10 @@ class AuditReadTest(unittest.TestCase):
             records = [record for record, error in events if record is not None]
             errors = [error for record, error in events if error is not None]
             self.assertEqual([record["request_id"] for record in records], ["r1", "r2"])
-            self.assertEqual(errors[0]["reason"], "bad_index_json")
+            self.assertEqual(
+                [error["reason"] for error in errors],
+                ["bad_index_json", "bad_index_record"],
+            )
 
     def test_load_audit_record_returns_error_for_missing_file(self):
         pipeline = load_pipeline_module()
