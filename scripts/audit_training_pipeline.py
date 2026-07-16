@@ -9,8 +9,10 @@ DEFAULT_OUTPUT_ROOT = "audit_training"
 import hashlib
 import json
 import math
+import os
 import pathlib
 import re
+import urllib.request
 
 
 REDACTION_PATTERNS = [
@@ -415,6 +417,104 @@ def normalize_model_label(model_label):
     if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
         return None
     return {"label": label, "confidence": confidence}
+
+
+
+def safe_positive_int(value, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+def load_label_config(env=None):
+    source = os.environ if env is None else env
+    base_url = source.get("AUDIT_LABEL_BASE_URL", "").rstrip("/")
+    api_key = source.get("AUDIT_LABEL_API_KEY", "")
+    model = source.get("AUDIT_LABEL_MODEL", "")
+    timeout = safe_positive_int(source.get("AUDIT_LABEL_TIMEOUT", "30"), 30)
+    max_concurrency = safe_positive_int(
+        source.get("AUDIT_LABEL_MAX_CONCURRENCY", "1"), 1
+    )
+    return {
+        "enabled": bool(base_url and api_key and model),
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "timeout": max(1, timeout),
+        "max_concurrency": max(1, max_concurrency),
+    }
+
+
+def parse_label_response(text):
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    normalized = normalize_model_label(payload)
+    if normalized is None:
+        return None
+    return {
+        "label": normalized["label"],
+        "confidence": normalized["confidence"],
+        "reason": str(payload.get("reason", "")),
+    }
+
+
+def call_label_model(router_record, config, urlopen=None):
+    if not config.get("enabled"):
+        return None, "labeler_disabled"
+    prompt = {
+        "task": "classify_route",
+        "labels": sorted(ROUTE_LABELS),
+        "sample": router_record,
+        "response_format": {
+            "label": "string",
+            "confidence": "number",
+            "reason": "string",
+        },
+    }
+    body = json.dumps(
+        {
+            "model": config["model"],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Return only JSON for route classification.",
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        config["base_url"] + "/chat/completions",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + config["api_key"],
+            "Content-Type": "application/json",
+        },
+    )
+    opener = urlopen or urllib.request.urlopen
+    try:
+        with opener(request, timeout=config["timeout"]) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return None, "labeler_request_failed:%s" % exc.__class__.__name__
+    try:
+        content = (
+            ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        )
+    except AttributeError:
+        return None, "labeler_invalid_response"
+    parsed = parse_label_response(content)
+    if parsed is None:
+        return None, "labeler_invalid_response"
+    return parsed, None
 
 
 def final_route_label(canonical):

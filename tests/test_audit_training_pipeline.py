@@ -828,5 +828,168 @@ class ExporterTest(unittest.TestCase):
         self.assertEqual(sft["messages"][0], {"role": "user", "content": "请写 Python 代码"})
 
 
+class LabelModelTest(unittest.TestCase):
+    def test_parse_label_response_accepts_controlled_json(self):
+        pipeline = load_pipeline_module()
+        parsed = pipeline.parse_label_response('{"label":"tool_agent","confidence":0.82,"reason":"uses tools"}')
+        self.assertEqual(parsed["label"], "tool_agent")
+        self.assertEqual(parsed["confidence"], 0.82)
+        self.assertEqual(parsed["reason"], "uses tools")
+
+    def test_parse_label_response_rejects_unknown_label(self):
+        pipeline = load_pipeline_module()
+        parsed = pipeline.parse_label_response('{"label":"bad_label","confidence":0.99,"reason":"no"}')
+        self.assertIsNone(parsed)
+
+    def test_parse_label_response_rejects_malformed_or_non_object_json(self):
+        pipeline = load_pipeline_module()
+        self.assertIsNone(pipeline.parse_label_response("{bad json}"))
+        self.assertIsNone(pipeline.parse_label_response("[]"))
+
+    def test_parse_label_response_rejects_unsafe_confidence_values(self):
+        pipeline = load_pipeline_module()
+        for confidence in ("0.9", True, float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(confidence=confidence):
+                text = json.dumps(
+                    {"label": "tool_agent", "confidence": confidence, "reason": "no"},
+                    allow_nan=True,
+                )
+                self.assertIsNone(pipeline.parse_label_response(text))
+
+    def test_parse_label_response_stringifies_reason(self):
+        pipeline = load_pipeline_module()
+        parsed = pipeline.parse_label_response(
+            '{"label":"tool_agent","confidence":0.82,"reason":{"why":"tools"}}'
+        )
+        self.assertEqual(parsed["reason"], "{'why': 'tools'}")
+
+    def test_label_config_reads_environment(self):
+        pipeline = load_pipeline_module()
+        env = {
+            "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+            "AUDIT_LABEL_API_KEY": "key",
+            "AUDIT_LABEL_MODEL": "label-model",
+            "AUDIT_LABEL_TIMEOUT": "12",
+            "AUDIT_LABEL_MAX_CONCURRENCY": "3",
+        }
+        config = pipeline.load_label_config(env)
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["timeout"], 12)
+        self.assertEqual(config["max_concurrency"], 3)
+
+    def test_label_config_disables_when_required_values_are_missing(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.load_label_config(
+            {
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+            }
+        )
+        self.assertFalse(config["enabled"])
+
+    def test_label_config_safely_defaults_invalid_numbers(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.load_label_config(
+            {
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1/",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+                "AUDIT_LABEL_TIMEOUT": "bad",
+                "AUDIT_LABEL_MAX_CONCURRENCY": "0",
+            }
+        )
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["base_url"], "https://example.test/v1")
+        self.assertEqual(config["timeout"], 30)
+        self.assertEqual(config["max_concurrency"], 1)
+
+    def test_call_label_model_disabled_returns_reason(self):
+        pipeline = load_pipeline_module()
+        parsed, error = pipeline.call_label_model({}, {"enabled": False})
+        self.assertIsNone(parsed)
+        self.assertEqual(error, "labeler_disabled")
+
+    def test_call_label_model_parses_successful_response(self):
+        pipeline = load_pipeline_module()
+        calls = []
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"label":"tool_agent","confidence":0.91,"reason":"tools"}'
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            calls.append((request, timeout))
+            return FakeResponse()
+
+        config = {
+            "enabled": True,
+            "base_url": "https://example.test/v1",
+            "api_key": "key",
+            "model": "label-model",
+            "timeout": 12,
+        }
+        parsed, error = pipeline.call_label_model(
+            {"input": "use a tool"}, config, urlopen=fake_urlopen
+        )
+        self.assertIsNone(error)
+        self.assertEqual(parsed["label"], "tool_agent")
+        self.assertEqual(parsed["confidence"], 0.91)
+        self.assertEqual(calls[0][1], 12)
+        self.assertEqual(calls[0][0].full_url, "https://example.test/v1/chat/completions")
+
+    def test_call_label_model_rejects_invalid_response(self):
+        pipeline = load_pipeline_module()
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"label":"bad_label","confidence":0.91,"reason":"no"}'
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            return FakeResponse()
+
+        config = {
+            "enabled": True,
+            "base_url": "https://example.test/v1",
+            "api_key": "key",
+            "model": "label-model",
+            "timeout": 12,
+        }
+        parsed, error = pipeline.call_label_model({}, config, urlopen=fake_urlopen)
+        self.assertIsNone(parsed)
+        self.assertEqual(error, "labeler_invalid_response")
+
+
 if __name__ == "__main__":
     unittest.main()
