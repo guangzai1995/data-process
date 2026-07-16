@@ -1350,6 +1350,89 @@ class PipelineRunTest(unittest.TestCase):
             self.assertFalse((root / "2026-07-15").exists())
             self.assertFalse(output_root.exists())
 
+
+    def test_write_outputs_rejects_tmp_symlink_without_deleting_final(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            final = output_root / "canonical" / "old.jsonl"
+            final.parent.mkdir(parents=True)
+            final.write_text("old-final\n", encoding="utf-8")
+            tmp_parent = output_root / ".tmp"
+            tmp_parent.mkdir()
+            (tmp_parent / "2026-07-15").symlink_to("../canonical")
+
+            with self.assertRaises(ValueError):
+                pipeline.write_outputs_atomically(
+                    str(output_root),
+                    "2026-07-15",
+                    {"canonical/2026-07-15.jsonl": [{"new": True}]},
+                )
+
+            self.assertTrue(final.exists())
+            self.assertEqual(final.read_text(encoding="utf-8"), "old-final\n")
+
+    def test_process_date_cleans_tmp_when_writer_open_fails(self):
+        pipeline = load_pipeline_module()
+        original_outputs = pipeline.JSONL_OUTPUTS
+        try:
+            pipeline.JSONL_OUTPUTS = (
+                "canonical/%s.jsonl",
+                "../bad/%s.jsonl",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                detail = day / "u" / "s" / "001.json"
+                write_json(detail, sample_success_record())
+                (day / "_request_index.jsonl").write_text(
+                    json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ValueError):
+                    pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+                self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
+                self.assertFalse((output_root / ".tmp" / "2026-07-15.backup").exists())
+        finally:
+            pipeline.JSONL_OUTPUTS = original_outputs
+
+    def test_write_outputs_rolls_back_new_final_and_restores_old_final(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = pathlib.Path(tmp) / "out"
+            new_final = output_root / "canonical" / "2026-07-15.jsonl"
+            old_final = output_root / "reports" / "2026-07-15.stats.json"
+            old_final.parent.mkdir(parents=True)
+            old_final.write_text('{"old":"stats"}', encoding="utf-8")
+            outputs = {
+                "canonical/2026-07-15.jsonl": [{"new": "canonical"}],
+                "reports/2026-07-15.stats.json": {"new": "stats"},
+            }
+            original_replace = pipeline.os.replace
+            calls = []
+
+            def fail_third_replace(src, dst):
+                calls.append((src, dst))
+                if len(calls) == 3:
+                    raise OSError("injected replace failure")
+                original_replace(src, dst)
+
+            pipeline.os.replace = fail_third_replace
+            try:
+                with self.assertRaises(OSError):
+                    pipeline.write_outputs_atomically(str(output_root), "2026-07-15", outputs)
+            finally:
+                pipeline.os.replace = original_replace
+
+            self.assertFalse(new_final.exists())
+            self.assertEqual(old_final.read_text(encoding="utf-8"), '{"old":"stats"}')
+            self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
+            self.assertFalse((output_root / ".tmp" / "2026-07-15.backup").exists())
+
     def test_main_guard_stays_after_pipeline_run_tests(self):
         source = pathlib.Path(__file__).read_text(encoding="utf-8")
         self.assertGreater(

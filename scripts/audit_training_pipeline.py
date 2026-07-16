@@ -6,12 +6,14 @@ DEFAULT_INPUT_ROOT = "/isos_data_share/audit"
 DEFAULT_OUTPUT_ROOT = "audit_training"
 
 
+import datetime
 import hashlib
 import json
 import math
 import os
 import pathlib
 import re
+import shutil
 import urllib.request
 
 
@@ -590,10 +592,6 @@ def export_router(canonical):
     }
 
 
-import datetime
-import shutil
-
-
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 JSONL_OUTPUTS = (
     "canonical/%s.jsonl",
@@ -633,6 +631,41 @@ def path_under(root, relative):
     except ValueError:
         raise ValueError("path escapes root: %s" % relative)
     return candidate
+
+
+def lexical_path_under(root, relative):
+    validate_relative_path(relative)
+    root = pathlib.Path(root).resolve()
+    candidate = pathlib.Path(root) / relative
+    parent = candidate.parent
+    if parent.exists() and parent.is_symlink():
+        raise ValueError("unsafe symlink parent: %s" % parent)
+    try:
+        parent.resolve().relative_to(root)
+    except ValueError:
+        raise ValueError("path escapes root: %s" % relative)
+    return candidate
+
+
+def safe_remove_tree_leaf(path, root):
+    root = pathlib.Path(root).resolve()
+    path = pathlib.Path(path)
+    parent = path.parent
+    if parent.exists() and parent.is_symlink():
+        raise ValueError("unsafe symlink parent: %s" % parent)
+    try:
+        parent.resolve().relative_to(root)
+    except ValueError:
+        raise ValueError("path parent escapes root: %s" % path)
+    try:
+        path.lstat()
+    except OSError:
+        return
+    if os.path.islink(str(path)):
+        raise ValueError("unsafe symlink temp path: %s" % path)
+    if not path.is_dir():
+        raise ValueError("unsafe non-directory temp path: %s" % path)
+    shutil.rmtree(str(path))
 
 
 def unsafe_detail_path_error(index_record):
@@ -749,11 +782,10 @@ def output_relative_paths(date):
 def prepare_tmp_roots(output_root, date):
     validate_date_string(date)
     output_root = pathlib.Path(output_root)
-    tmp_root = path_under(output_root, ".tmp/%s" % date)
-    backup_root = path_under(output_root, ".tmp/%s.backup" % date)
-    for root in (tmp_root, backup_root):
-        if root.exists():
-            shutil.rmtree(str(root))
+    tmp_root = lexical_path_under(output_root, ".tmp/%s" % date)
+    backup_root = lexical_path_under(output_root, ".tmp/%s.backup" % date)
+    safe_remove_tree_leaf(tmp_root, output_root)
+    safe_remove_tree_leaf(backup_root, output_root)
     tmp_root.mkdir(parents=True)
     return output_root, tmp_root, backup_root
 
@@ -764,6 +796,10 @@ def cleanup_path(path):
             shutil.rmtree(str(path))
         else:
             path.unlink()
+
+
+def cleanup_tmp_root(path, output_root):
+    safe_remove_tree_leaf(path, output_root)
 
 
 def rollback_replacements(created_finals, backups):
@@ -778,8 +814,8 @@ def rollback_replacements(created_finals, backups):
 
 def commit_tmp_outputs(output_root, date, relative_paths):
     output_root = pathlib.Path(output_root)
-    tmp_root = path_under(output_root, ".tmp/%s" % date)
-    backup_root = path_under(output_root, ".tmp/%s.backup" % date)
+    tmp_root = lexical_path_under(output_root, ".tmp/%s" % date)
+    backup_root = lexical_path_under(output_root, ".tmp/%s.backup" % date)
     backups = []
     created_finals = []
     try:
@@ -799,8 +835,8 @@ def commit_tmp_outputs(output_root, date, relative_paths):
         rollback_replacements(created_finals, backups)
         raise
     finally:
-        cleanup_path(tmp_root)
-        cleanup_path(backup_root)
+        cleanup_tmp_root(tmp_root, output_root)
+        cleanup_tmp_root(backup_root, output_root)
 
 
 def write_outputs_atomically(output_root, date, outputs):
@@ -817,17 +853,21 @@ def write_outputs_atomically(output_root, date, outputs):
                 write_json_file(target, value)
         commit_tmp_outputs(output_root, date, relative_paths)
     except Exception:
-        cleanup_path(tmp_root)
-        cleanup_path(backup_root)
+        cleanup_tmp_root(tmp_root, output_root)
+        cleanup_tmp_root(backup_root, output_root)
         raise
 
 
 def open_stream_writers(tmp_root, date):
     handles = {}
-    for relative in [template % date for template in JSONL_OUTPUTS]:
-        path = path_under(tmp_root, relative)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handles[relative] = path.open("w", encoding="utf-8")
+    try:
+        for relative in [template % date for template in JSONL_OUTPUTS]:
+            path = path_under(tmp_root, relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handles[relative] = path.open("w", encoding="utf-8")
+    except Exception:
+        close_stream_writers(handles)
+        raise
     return handles
 
 
@@ -904,15 +944,16 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
     output_root_path = pathlib.Path(output_root)
     tmp_root = None
+    backup_root = None
     handles = {}
-    if not dry_run:
-        output_root_path, tmp_root, backup_root = prepare_tmp_roots(output_root_path, date)
-        handles = open_stream_writers(tmp_root, date)
     stats = init_stats()
     index_record_count = 0
     files_attempted = 0
     files_loaded = 0
     try:
+        if not dry_run:
+            output_root_path, tmp_root, backup_root = prepare_tmp_roots(output_root_path, date)
+            handles = open_stream_writers(tmp_root, date)
         for index_record, index_error in iter_index_records(input_root, date):
             if index_error is not None:
                 update_stats_for_reject(stats, index_error)
@@ -963,9 +1004,12 @@ def process_date(input_root, output_root, date, limit=None, dry_run=False):
             commit_tmp_outputs(output_root_path, date, output_relative_paths(date))
         return manifest
     except Exception:
-        if handles:
-            close_stream_writers(handles)
-        if tmp_root is not None:
-            cleanup_path(tmp_root)
-            cleanup_path(path_under(output_root_path, ".tmp/%s.backup" % date))
+        try:
+            if handles:
+                close_stream_writers(handles)
+        finally:
+            if tmp_root is not None:
+                cleanup_tmp_root(tmp_root, output_root_path)
+            if backup_root is not None:
+                cleanup_tmp_root(backup_root, output_root_path)
         raise
