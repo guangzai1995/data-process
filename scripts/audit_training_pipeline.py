@@ -66,7 +66,12 @@ def iter_index_records(input_root, date):
             if not stripped:
                 continue
             try:
-                record = json.loads(stripped, parse_constant=reject_json_constant)
+                record = json.loads(
+                    stripped,
+                    parse_constant=reject_json_constant,
+                    parse_float=parse_finite_float,
+                    parse_int=parse_limited_int,
+                )
             except ValueError:
                 yield None, {"line": line_number, "reason": "bad_index_json"}
                 continue
@@ -191,6 +196,21 @@ def reject_record(date, index_record, reason):
 
 
 USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+MAX_USAGE_TOKENS = 10 ** 9
+
+
+def parse_finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def parse_limited_int(value):
+    parsed = int(value)
+    if parsed > MAX_USAGE_TOKENS:
+        raise ValueError("integer JSON number too large")
+    return parsed
 
 
 def sanitize_usage(usage):
@@ -212,6 +232,8 @@ def sanitize_usage(usage):
             if not value.is_integer():
                 return None
             value = int(value)
+        if value > MAX_USAGE_TOKENS:
+            return None
         sanitized[key] = value
     return sanitized
 
@@ -261,9 +283,13 @@ def valid_function_payload(function, require_arguments=False):
         return False
     if not isinstance(function.get("name"), str) or not function.get("name"):
         return False
+    if require_arguments and "arguments" not in function:
+        return False
     if "arguments" in function and not isinstance(function.get("arguments"), str):
         return False
-    if require_arguments and "arguments" in function and not isinstance(function.get("arguments"), str):
+    if "description" in function and not isinstance(function.get("description"), str):
+        return False
+    if "parameters" in function and not isinstance(function.get("parameters"), dict):
         return False
     for optional_key in ("description", "parameters"):
         if optional_key in function and not json_serializable(function[optional_key]):
@@ -297,16 +323,19 @@ def valid_tool_call(tool_call):
 def valid_response_message(message):
     if not isinstance(message, dict):
         return False
-    if "content" in message and not valid_message_content(message.get("content")):
-        return False
-    if "tool_calls" in message:
-        tool_calls = message.get("tool_calls")
+    tool_calls = message.get("tool_calls")
+    has_tool_calls = tool_calls is not None
+    if has_tool_calls:
         if not isinstance(tool_calls, list):
             return False
         for tool_call in tool_calls:
             if not valid_tool_call(tool_call):
                 return False
-    return True
+    if "content" not in message:
+        return has_tool_calls
+    if message.get("content") is None:
+        return has_tool_calls
+    return valid_message_content(message.get("content"))
 
 
 SAFE_REQUEST_PARAM_KEYS = (
@@ -557,16 +586,12 @@ def load_label_config(env=None):
     api_key = source.get("AUDIT_LABEL_API_KEY", "")
     model = source.get("AUDIT_LABEL_MODEL", "")
     timeout = clamped_int(source.get("AUDIT_LABEL_TIMEOUT", "30"), 30, 1, 120)
-    max_concurrency = clamped_int(
-        source.get("AUDIT_LABEL_MAX_CONCURRENCY", "1"), 1, 1, 16
-    )
     return {
         "enabled": bool(base_url and api_key and model),
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
         "timeout": timeout,
-        "max_concurrency": max_concurrency,
     }
 
 
@@ -634,16 +659,16 @@ def call_label_model(router_record, config, urlopen=None):
             "temperature": 0,
         }
     ).encode("utf-8")
-    request = urllib.request.Request(
-        config["base_url"] + "/chat/completions",
-        data=body,
-        headers={
-            "Authorization": "Bearer " + config["api_key"],
-            "Content-Type": "application/json",
-        },
-    )
     opener = urlopen or urllib.request.urlopen
     try:
+        request = urllib.request.Request(
+            config["base_url"] + "/chat/completions",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + config["api_key"],
+                "Content-Type": "application/json",
+            },
+        )
         with opener(request, timeout=config["timeout"]) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
@@ -1097,7 +1122,12 @@ def load_audit_record(input_root, index_record):
         }
     try:
         with detail_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle, parse_constant=reject_json_constant), None
+            return json.load(
+                handle,
+                parse_constant=reject_json_constant,
+                parse_float=parse_finite_float,
+                parse_int=parse_limited_int,
+            ), None
     except ValueError:
         return None, {
             "request_id": index_record.get("request_id"),

@@ -686,6 +686,9 @@ class CanonicalBuildTest(unittest.TestCase):
             [{"type": "function"}],
             [{"type": "function", "function": {}}],
             [{"type": "function", "function": {"name": ""}}],
+            [{"type": "function", "function": {"name": "search", "description": 123}}],
+            [{"type": "function", "function": {"name": "search", "parameters": "not-object"}}],
+            [{"type": "function", "function": {"name": "search", "parameters": []}}],
             [{"type": "retrieval", "function": {"name": "search"}}],
         ]
         for tools in invalid_tools:
@@ -706,6 +709,7 @@ class CanonicalBuildTest(unittest.TestCase):
             [{"id": "call_1", "type": "function", "function": {}}],
             [{"id": "", "type": "function", "function": {"name": "search"}}],
             [{"id": "call_1", "type": "retrieval", "function": {"name": "search"}}],
+            [{"id": "call_1", "type": "function", "function": {"name": "search"}}],
             [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": {}}}],
         ]
         for tool_calls in invalid_tool_calls:
@@ -752,6 +756,35 @@ class CanonicalBuildTest(unittest.TestCase):
         )
         self.assertIsNone(reject)
         self.assertIn("tool_use_sft", canonical["quality"]["task_types"])
+
+
+    def test_build_canonical_sample_accepts_null_content_with_valid_tool_calls(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search"}}
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        self.assertIn("tool_use_sft", canonical["quality"]["task_types"])
+        exported = pipeline.export_tool_use_sft(canonical)
+        self.assertEqual(exported["response_message"]["tool_calls"][0]["id"], "call_1")
 
 
 class ExporterTest(unittest.TestCase):
@@ -1184,12 +1217,11 @@ class LabelModelTest(unittest.TestCase):
             "AUDIT_LABEL_API_KEY": "key",
             "AUDIT_LABEL_MODEL": "label-model",
             "AUDIT_LABEL_TIMEOUT": "12",
-            "AUDIT_LABEL_MAX_CONCURRENCY": "3",
         }
         config = pipeline.load_label_config(env)
         self.assertTrue(config["enabled"])
         self.assertEqual(config["timeout"], 12)
-        self.assertEqual(config["max_concurrency"], 3)
+        self.assertNotIn("max_concurrency", config)
 
     def test_label_config_disables_when_required_values_are_missing(self):
         pipeline = load_pipeline_module()
@@ -1208,33 +1240,16 @@ class LabelModelTest(unittest.TestCase):
             "AUDIT_LABEL_API_KEY": "key",
             "AUDIT_LABEL_MODEL": "label-model",
         }
-        config = pipeline.load_label_config(
-            dict(
-                base_env,
-                AUDIT_LABEL_TIMEOUT="999999",
-                AUDIT_LABEL_MAX_CONCURRENCY="999999",
-            )
-        )
+        config = pipeline.load_label_config(dict(base_env, AUDIT_LABEL_TIMEOUT="999999"))
         self.assertTrue(config["enabled"])
         self.assertEqual(config["base_url"], "https://example.test/v1")
         self.assertEqual(config["timeout"], 120)
-        self.assertEqual(config["max_concurrency"], 16)
 
-        config = pipeline.load_label_config(
-            dict(base_env, AUDIT_LABEL_TIMEOUT="-5", AUDIT_LABEL_MAX_CONCURRENCY="0")
-        )
+        config = pipeline.load_label_config(dict(base_env, AUDIT_LABEL_TIMEOUT="-5"))
         self.assertEqual(config["timeout"], 1)
-        self.assertEqual(config["max_concurrency"], 1)
 
-        config = pipeline.load_label_config(
-            dict(
-                base_env,
-                AUDIT_LABEL_TIMEOUT="bad",
-                AUDIT_LABEL_MAX_CONCURRENCY="bad",
-            )
-        )
+        config = pipeline.load_label_config(dict(base_env, AUDIT_LABEL_TIMEOUT="bad"))
         self.assertEqual(config["timeout"], 30)
-        self.assertEqual(config["max_concurrency"], 1)
 
     def test_call_label_model_disabled_returns_reason(self):
         pipeline = load_pipeline_module()
@@ -1548,6 +1563,32 @@ class PipelineRunTest(unittest.TestCase):
                 "",
             )
 
+    def test_process_date_rejects_overflow_float_detail_and_continues(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            bad_detail = day / "u" / "s" / "001.json"
+            good_detail = day / "u" / "s" / "002.json"
+            bad_detail.parent.mkdir(parents=True)
+            raw_json = json.dumps(sample_success_record(), ensure_ascii=False)
+            raw_json = raw_json.replace('"prompt_tokens": 10', '"prompt_tokens": 1e9999')
+            bad_detail.write_text(raw_json, encoding="utf-8")
+            write_json(good_detail, sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "bad", "file_path": "2026-07-15/u/s/001.json"}) + "\n"
+                + json.dumps({"request_id": "good", "file_path": "2026-07-15/u/s/002.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(result["rejected"], 1)
+            self.assertEqual(result["reject_reasons"], {"bad_detail_json": 1})
+            canonical_lines = (output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(canonical_lines), 1)
+
     def test_process_date_applies_successful_labeler_to_canonical_and_router(self):
         pipeline = load_pipeline_module()
         old_env = os.environ.copy()
@@ -1644,6 +1685,39 @@ class PipelineRunTest(unittest.TestCase):
                 self.assertNotIn("secret@example.com", router_text)
         finally:
             pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_date_labeler_bad_url_safely_degrades(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "::::",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                write_json(day / "u" / "s" / "001.json", sample_success_record())
+                (day / "_request_index.jsonl").write_text(
+                    json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                    encoding="utf-8",
+                )
+                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                router_text = (output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8")
+                router = json.loads(router_text)
+                self.assertEqual(result["accepted"], 1)
+                self.assertEqual(router["labels"]["final_label"], "code_generation")
+                self.assertIsNone(router["labels"]["model_label"])
+                self.assertNotIn("ValueError", router_text)
+                self.assertNotIn("unknown url type", router_text)
+        finally:
             os.environ.clear()
             os.environ.update(old_env)
 
