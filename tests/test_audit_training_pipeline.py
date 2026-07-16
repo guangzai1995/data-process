@@ -1080,3 +1080,157 @@ class LabelModelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PipelineRunTest(unittest.TestCase):
+    def test_process_date_writes_expected_outputs(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            detail = day / "u" / "s" / "001.json"
+            write_json(detail, sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", limit=None, dry_run=False)
+            self.assertEqual(result["accepted"], 1)
+            self.assertTrue((output_root / "canonical" / "2026-07-15.jsonl").exists())
+            self.assertTrue((output_root / "sft" / "2026-07-15.jsonl").exists())
+            self.assertTrue((output_root / "router_classification" / "2026-07-15.jsonl").exists())
+            self.assertTrue((output_root / "reports" / "2026-07-15.stats.json").exists())
+            self.assertTrue((output_root / "manifests" / "2026-07-15.manifest.json").exists())
+
+    def test_process_date_dry_run_does_not_write_final_outputs(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            detail = day / "u" / "s" / "001.json"
+            write_json(detail, sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", limit=1, dry_run=True)
+            self.assertEqual(result["accepted"], 1)
+            self.assertFalse((output_root / "canonical" / "2026-07-15.jsonl").exists())
+
+    def test_process_date_outputs_parse_and_counts_match_manifest(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            bad = sample_success_record()
+            bad["status"] = "failed"
+            write_json(day / "u" / "s" / "002.json", bad)
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n"
+                + json.dumps({"request_id": "request-2", "file_path": "2026-07-15/u/s/002.json"}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            canonical_lines = (output_root / "canonical" / "2026-07-15.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            reject_lines = (output_root / "reports" / "2026-07-15.rejects.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            stats = json.loads(
+                (output_root / "reports" / "2026-07-15.stats.json").read_text(encoding="utf-8")
+            )
+            manifest = json.loads(
+                (output_root / "manifests" / "2026-07-15.manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(len([json.loads(line) for line in canonical_lines]), 1)
+            self.assertEqual(len([json.loads(line) for line in reject_lines]), 1)
+            self.assertEqual(stats["accepted"], manifest["accepted"])
+            self.assertEqual(stats["rejected"], manifest["rejected"])
+            self.assertEqual(manifest["files_loaded"], 2)
+
+    def test_collect_outputs_skips_none_exporter_records(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["response"]["finish_reason"] = "length"
+        outputs = pipeline.collect_outputs(
+            "2026-07-15",
+            [canonical],
+            [],
+            [],
+            {"accepted": 1, "rejected": 0},
+            {"accepted": 1, "rejected": 0},
+        )
+        self.assertEqual(outputs["sft/2026-07-15.jsonl"], [])
+        self.assertNotIn(None, outputs["sft/2026-07-15.jsonl"])
+
+    def test_process_date_rejects_do_not_include_raw_messages(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["status"] = "failed"
+            write_json(day / "u" / "s" / "001.json", raw)
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+            rejects = (output_root / "reports" / "2026-07-15.rejects.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("messages", rejects)
+            self.assertNotIn("13800138000", rejects)
+
+    def test_process_date_dry_run_leaves_no_outputs_or_tmp(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            detail = day / "u" / "s" / "001.json"
+            write_json(detail, sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15", dry_run=True)
+            self.assertFalse((output_root / "canonical" / "2026-07-15.jsonl").exists())
+            self.assertFalse((output_root / ".tmp" / "2026-07-15").exists())
+
+    def test_process_date_limit_counts_detail_attempts_not_index_errors(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            (day / "_request_index.jsonl").write_text(
+                "{bad json}\n"
+                + json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
+                encoding="utf-8",
+            )
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", limit=1)
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(result["rejected"], 1)
+            self.assertEqual(result["files_loaded"], 1)

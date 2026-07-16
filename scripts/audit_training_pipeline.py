@@ -608,3 +608,151 @@ def export_router(canonical):
             "confidence": confidence,
         },
     }
+
+
+import datetime
+import shutil
+
+
+def write_jsonl(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def write_json_file(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def build_stats(canonical_records, rejects):
+    stats = {
+        "accepted": len(canonical_records),
+        "rejected": len(rejects),
+        "models": {},
+        "finish_reasons": {},
+        "task_types": {},
+        "reject_reasons": {},
+        "redaction_hits": {},
+    }
+    for canonical in canonical_records:
+        model = canonical["request"].get("model") or "unknown"
+        stats["models"][model] = stats["models"].get(model, 0) + 1
+        finish_reason = canonical["response"].get("finish_reason") or "unknown"
+        stats["finish_reasons"][finish_reason] = stats["finish_reasons"].get(finish_reason, 0) + 1
+        for task_type in canonical["quality"].get("task_types", []):
+            stats["task_types"][task_type] = stats["task_types"].get(task_type, 0) + 1
+        for key, value in canonical["quality"].get("redaction_stats", {}).items():
+            stats["redaction_hits"][key] = stats["redaction_hits"].get(key, 0) + value
+    for reject in rejects:
+        reason = reject.get("reason", "unknown")
+        stats["reject_reasons"][reason] = stats["reject_reasons"].get(reason, 0) + 1
+    return stats
+
+
+def append_if_record(records, record):
+    if record is not None:
+        records.append(record)
+
+
+def collect_outputs(date, canonical_records, rejects, label_queue, stats, manifest):
+    sft_records = []
+    tool_records = []
+    router_records = []
+    for canonical in canonical_records:
+        if "sft" in canonical["quality"].get("task_types", []):
+            append_if_record(sft_records, export_sft(canonical))
+        if "tool_use_sft" in canonical["quality"].get("task_types", []):
+            append_if_record(tool_records, export_tool_use_sft(canonical))
+        router_record = export_router(canonical)
+        append_if_record(router_records, router_record)
+        if router_record is not None and router_record["labels"].get("confidence") == "low":
+            label_queue.append({
+                "sample_id": canonical["sample_id"],
+                "reason": "low_confidence_route",
+                "router": router_record,
+            })
+    return {
+        "canonical/%s.jsonl" % date: canonical_records,
+        "sft/%s.jsonl" % date: sft_records,
+        "tool_use_sft/%s.jsonl" % date: tool_records,
+        "router_classification/%s.jsonl" % date: router_records,
+        "label_queue/%s.jsonl" % date: label_queue,
+        "reports/%s.rejects.jsonl" % date: rejects,
+        "reports/%s.stats.json" % date: stats,
+        "manifests/%s.manifest.json" % date: manifest,
+    }
+
+
+def write_outputs_atomically(output_root, date, outputs):
+    output_root = pathlib.Path(output_root)
+    tmp_root = output_root / ".tmp" / date
+    if tmp_root.exists():
+        shutil.rmtree(str(tmp_root))
+    tmp_root.mkdir(parents=True)
+    try:
+        for relative, value in outputs.items():
+            target = tmp_root / relative
+            if relative.endswith(".jsonl"):
+                write_jsonl(target, value)
+            else:
+                write_json_file(target, value)
+        for relative in outputs:
+            final = output_root / relative
+            final.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = tmp_root / relative
+            if final.exists():
+                final.unlink()
+            shutil.move(str(temp_file), str(final))
+    finally:
+        if tmp_root.exists():
+            shutil.rmtree(str(tmp_root))
+
+
+def process_date(input_root, output_root, date, limit=None, dry_run=False):
+    started_at = datetime.datetime.utcnow().isoformat() + "Z"
+    canonical_records = []
+    rejects = []
+    label_queue = []
+    index_record_count = 0
+    files_loaded = 0
+    for index_record, index_error in iter_index_records(input_root, date):
+        if index_error is not None:
+            rejects.append(index_error)
+            continue
+        index_record_count += 1
+        if limit is not None and files_loaded >= limit:
+            break
+        raw, error = load_audit_record(input_root, index_record)
+        if error:
+            rejects.append(error)
+            continue
+        files_loaded += 1
+        canonical, reject = build_canonical_sample(date, index_record, raw)
+        if reject:
+            rejects.append(reject)
+            continue
+        canonical_records.append(canonical)
+    finished_at = datetime.datetime.utcnow().isoformat() + "Z"
+    stats = build_stats(canonical_records, rejects)
+    manifest = {
+        "date": date,
+        "input_root": str(input_root),
+        "output_root": str(output_root),
+        "index_records": index_record_count,
+        "files_loaded": files_loaded,
+        "accepted": len(canonical_records),
+        "rejected": len(rejects),
+        "pipeline_version": PIPELINE_VERSION,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "dry_run": bool(dry_run),
+    }
+    outputs = collect_outputs(date, canonical_records, rejects, label_queue, stats, manifest)
+    if not dry_run:
+        write_outputs_atomically(output_root, date, outputs)
+    return manifest
