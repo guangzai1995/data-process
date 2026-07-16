@@ -312,3 +312,127 @@ def build_canonical_sample(date, index_record, raw_record, max_prompt_chars=2000
         },
     }
     return canonical, None
+
+ROUTE_LABELS = set([
+    "general_chat",
+    "code_generation",
+    "tool_agent",
+    "long_context",
+    "reasoning",
+    "domain_qa",
+    "unsafe_or_invalid",
+    "unknown",
+])
+
+
+def last_user_content(messages):
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+                    elif isinstance(part, str):
+                        parts.append(part)
+                return "\n".join(parts)
+            if content is None:
+                return ""
+            return str(content)
+    return ""
+
+
+def has_tool_interaction(canonical):
+    return bool(
+        canonical["request"].get("tools")
+        or canonical["response"]["message"].get("tool_calls")
+    )
+
+
+def classify_by_rules(canonical):
+    request = canonical["request"]
+    usage = canonical["response"].get("usage") or {}
+    text = last_user_content(request.get("messages") or [])
+    lowered = text.lower()
+    if has_tool_interaction(canonical):
+        return "tool_agent"
+    if usage.get("prompt_tokens", 0) >= 64000 or len(stable_json(request.get("messages") or [])) >= 120000:
+        return "long_context"
+    if any(token in lowered for token in ["python", "代码", "函数", "bug", "sql", "shell", "脚本"]):
+        return "code_generation"
+    if any(token in lowered for token in ["推理", "证明", "分析", "为什么", "步骤"]):
+        return "reasoning"
+    if any(token in lowered for token in ["账单", "订单", "用户资料", "营业", "发票"]):
+        return "domain_qa"
+    return "general_chat"
+
+
+def final_route_label(canonical):
+    model_label = canonical["routing"].get("model_label")
+    if isinstance(model_label, dict) and model_label.get("confidence", 0) >= 0.75:
+        label = model_label.get("label")
+        if label in ROUTE_LABELS:
+            return label, "high"
+    rule_label = classify_by_rules(canonical)
+    if rule_label in ROUTE_LABELS:
+        return rule_label, "medium"
+    return "unknown", "low"
+
+
+def export_sft(canonical):
+    message = canonical["response"]["message"]
+    content = str(message.get("content") or "").strip()
+    if has_tool_interaction(canonical) or canonical["response"].get("finish_reason") == "length":
+        return None
+    return {
+        "sample_id": canonical["sample_id"],
+        "instruction": "",
+        "input": last_user_content(canonical["request"]["messages"]),
+        "output": content,
+        "messages": canonical["request"]["messages"] + [{"role": "assistant", "content": content}],
+        "metadata": {
+            "source_date": canonical["source"]["date"],
+            "model": canonical["request"].get("model"),
+        },
+    }
+
+
+def export_tool_use_sft(canonical):
+    if not has_tool_interaction(canonical):
+        return None
+    return {
+        "sample_id": canonical["sample_id"],
+        "messages": canonical["request"]["messages"],
+        "tools": canonical["request"].get("tools") or [],
+        "response_message": canonical["response"]["message"],
+        "metadata": {
+            "source_date": canonical["source"]["date"],
+            "finish_reason": canonical["response"].get("finish_reason"),
+            "model": canonical["request"].get("model"),
+        },
+    }
+
+
+def export_router(canonical):
+    rule_label = classify_by_rules(canonical)
+    final_label, confidence = final_route_label(canonical)
+    usage = canonical["response"].get("usage") or {}
+    messages = canonical["request"].get("messages") or []
+    return {
+        "sample_id": canonical["sample_id"],
+        "input": last_user_content(messages),
+        "features": {
+            "message_count": len(messages),
+            "has_tools": has_tool_interaction(canonical),
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "client_type": canonical["request"].get("params", {}).get("client_type", ""),
+        },
+        "labels": {
+            "weak_model_label": canonical["routing"].get("weak_model_label"),
+            "rule_label": rule_label,
+            "model_label": canonical["routing"].get("model_label"),
+            "final_label": final_label,
+            "confidence": confidence,
+        },
+    }

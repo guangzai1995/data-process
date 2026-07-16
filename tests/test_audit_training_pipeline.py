@@ -471,5 +471,91 @@ class CanonicalBuildTest(unittest.TestCase):
         self.assertEqual(reject["reason"], "prompt_too_long")
 
 
+class ExporterTest(unittest.TestCase):
+    def test_rule_classifier_detects_tool_code_and_long_context(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        self.assertEqual(pipeline.classify_by_rules(canonical), "code_generation")
+        canonical["request"]["tools"] = [
+            {"type": "function", "function": {"name": "search"}}
+        ]
+        self.assertEqual(pipeline.classify_by_rules(canonical), "tool_agent")
+        canonical["request"]["tools"] = []
+        canonical["response"]["usage"]["prompt_tokens"] = 90000
+        self.assertEqual(pipeline.classify_by_rules(canonical), "long_context")
+
+    def test_export_sft_tool_and_router_records(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        sft = pipeline.export_sft(canonical)
+        router = pipeline.export_router(canonical)
+        self.assertEqual(sft["sample_id"], canonical["sample_id"])
+        self.assertIn("input", sft)
+        self.assertIn("output", sft)
+        self.assertEqual(router["labels"]["rule_label"], "code_generation")
+        self.assertEqual(router["labels"]["final_label"], "code_generation")
+
+    def test_export_tool_use_sft_preserves_tool_calls(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search"}}
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{\"q\":\"hello\"}"},
+                }
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        exported = pipeline.export_tool_use_sft(canonical)
+        self.assertEqual(exported["response_message"]["tool_calls"][0]["id"], "call_1")
+
+    def test_export_sft_skips_tool_calls_and_length_outputs(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["response"]["message"]["tool_calls"] = [{"id": "call_1"}]
+        self.assertIsNone(pipeline.export_sft(canonical))
+        canonical["response"]["message"].pop("tool_calls")
+        canonical["response"]["finish_reason"] = "length"
+        self.assertIsNone(pipeline.export_sft(canonical))
+
+    def test_export_tool_use_sft_skips_non_tool_samples(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        self.assertIsNone(pipeline.export_tool_use_sft(canonical))
+
+
 if __name__ == "__main__":
     unittest.main()
