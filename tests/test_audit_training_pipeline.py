@@ -35,7 +35,7 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(redacted.count("<PHONE_1>"), 2)
         self.assertIn("<EMAIL_1>", redacted)
         self.assertIn("<CN_ID_1>", redacted)
-        self.assertGreaterEqual(stats["phone"], 1)
+        self.assertEqual(stats["phone"], 1)
         self.assertGreaterEqual(stats["email"], 1)
         self.assertGreaterEqual(stats["cn_id"], 1)
         self.assertGreaterEqual(stats["secret"], 1)
@@ -47,6 +47,14 @@ class RedactionTest(unittest.TestCase):
         self.assertIn("<BANK_CARD_1> ip <IP_1>", redacted)
         self.assertGreaterEqual(stats["bank_card"], 1)
         self.assertGreaterEqual(stats["ip"], 1)
+
+    def test_redact_text_prefers_secret_over_numeric_value_patterns(self):
+        pipeline = load_pipeline_module()
+        text = "api_key=1234567890123456"
+        redacted, stats = pipeline.redact_text(text)
+        self.assertIn("<SECRET_1>", redacted)
+        self.assertNotIn("<BANK_CARD_1>", redacted)
+        self.assertEqual(stats["secret"], 1)
 
     def test_hash_identifier_is_deterministic_and_not_plaintext(self):
         pipeline = load_pipeline_module()
