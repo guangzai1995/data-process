@@ -224,7 +224,10 @@ class AuditReadTest(unittest.TestCase):
                 "\n"
                 "{\"request_id\":\"r1\",\"file_path\":\"2026-07-15/u/s/001.json\"}\n"
                 "{bad json}\n"
+                "{\"request_id\":NaN,\"file_path\":\"2026-07-15/u/s/nan.json\"}\n"
                 "[]\n"
+                "{\"request_id\":123,\"file_path\":\"2026-07-15/u/s/number.json\"}\n"
+                "{\"request_id\":\"bad-path\",\"file_path\":123}\n"
                 "{\"request_id\":\"r2\",\"file_path\":\"2026-07-15/u/s/002.json\"}\n",
                 encoding="utf-8",
             )
@@ -234,7 +237,13 @@ class AuditReadTest(unittest.TestCase):
             self.assertEqual([record["request_id"] for record in records], ["r1", "r2"])
             self.assertEqual(
                 [error["reason"] for error in errors],
-                ["bad_index_json", "bad_index_record"],
+                [
+                    "bad_index_json",
+                    "bad_index_json",
+                    "bad_index_record",
+                    "bad_index_record",
+                    "bad_index_record",
+                ],
             )
 
     def test_load_audit_record_returns_error_for_missing_file(self):
@@ -615,6 +624,7 @@ class CanonicalBuildTest(unittest.TestCase):
             {"prompt_tokens": float("nan")},
             {"prompt_tokens": float("inf")},
             {"prompt_tokens": -1},
+            {"prompt_tokens": 1.5},
         ]
         for usage in invalid_usages:
             with self.subTest(usage=usage):
@@ -670,25 +680,78 @@ class CanonicalBuildTest(unittest.TestCase):
 
     def test_build_canonical_sample_rejects_invalid_tools_and_tool_calls(self):
         pipeline = load_pipeline_module()
-        raw = sample_success_record()
-        raw["request_body"]["tools"] = {"bad": "shape"}
-        canonical, reject = pipeline.build_canonical_sample(
-            "2026-07-15",
-            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
-            raw,
-        )
-        self.assertIsNone(canonical)
-        self.assertEqual(reject["reason"], "invalid_tools")
+        invalid_tools = [
+            {"bad": "shape"},
+            [{}],
+            [{"type": "function"}],
+            [{"type": "function", "function": {}}],
+            [{"type": "function", "function": {"name": ""}}],
+            [{"type": "retrieval", "function": {"name": "search"}}],
+        ]
+        for tools in invalid_tools:
+            with self.subTest(tools=tools):
+                raw = sample_success_record()
+                raw["request_body"]["tools"] = tools
+                canonical, reject = pipeline.build_canonical_sample(
+                    "2026-07-15",
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                    raw,
+                )
+                self.assertIsNone(canonical)
+                self.assertEqual(reject["reason"], "invalid_tools")
 
+        invalid_tool_calls = [
+            ["bad"],
+            [{}],
+            [{"id": "call_1", "type": "function", "function": {}}],
+            [{"id": "", "type": "function", "function": {"name": "search"}}],
+            [{"id": "call_1", "type": "retrieval", "function": {"name": "search"}}],
+            [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": {}}}],
+        ]
+        for tool_calls in invalid_tool_calls:
+            with self.subTest(tool_calls=tool_calls):
+                raw = sample_success_record()
+                raw["response_body"]["choices"][0]["message"]["tool_calls"] = tool_calls
+                canonical, reject = pipeline.build_canonical_sample(
+                    "2026-07-15",
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                    raw,
+                )
+                self.assertIsNone(canonical)
+                self.assertEqual(reject["reason"], "invalid_response_message")
+
+    def test_build_canonical_sample_accepts_valid_tool_and_tool_call_shapes(self):
+        pipeline = load_pipeline_module()
         raw = sample_success_record()
-        raw["response_body"]["choices"][0]["message"]["tool_calls"] = ["bad"]
+        raw["request_body"]["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search docs",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": ""},
+                }
+            ],
+        }
         canonical, reject = pipeline.build_canonical_sample(
             "2026-07-15",
             {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
             raw,
         )
-        self.assertIsNone(canonical)
-        self.assertEqual(reject["reason"], "invalid_response_message")
+        self.assertIsNone(reject)
+        self.assertIn("tool_use_sft", canonical["quality"]["task_types"])
 
 
 class ExporterTest(unittest.TestCase):
@@ -951,12 +1014,33 @@ class ExporterTest(unittest.TestCase):
         self.assertIsNone(reject)
         canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": 0.74}
         router = pipeline.export_router(canonical)
-        self.assertEqual(router["labels"]["final_label"], "code_generation")
-        self.assertEqual(router["labels"]["confidence"], "medium")
+        self.assertEqual(router["labels"]["final_label"], "tool_agent")
+        self.assertEqual(router["labels"]["confidence"], "low")
         self.assertEqual(
             router["labels"]["model_label"],
             {"label": "tool_agent", "confidence": 0.74},
         )
+
+    def test_collect_outputs_queues_low_confidence_model_label(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        canonical["routing"]["model_label"] = {"label": "tool_agent", "confidence": 0.74}
+        outputs = pipeline.collect_outputs(
+            "2026-07-15",
+            [canonical],
+            [],
+            [],
+            {"accepted": 1, "rejected": 0},
+            {"accepted": 1, "rejected": 0},
+        )
+        queue = outputs["label_queue/2026-07-15.jsonl"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["router"]["labels"]["final_label"], "tool_agent")
 
 
     def test_export_sft_rebuilds_messages_as_text_only(self):

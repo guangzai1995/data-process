@@ -66,13 +66,15 @@ def iter_index_records(input_root, date):
             if not stripped:
                 continue
             try:
-                record = json.loads(stripped)
+                record = json.loads(stripped, parse_constant=reject_json_constant)
             except ValueError:
                 yield None, {"line": line_number, "reason": "bad_index_json"}
                 continue
             if (
                 not isinstance(record, dict)
+                or not isinstance(record.get("request_id"), str)
                 or not record.get("request_id")
+                or not isinstance(record.get("file_path"), str)
                 or not record.get("file_path")
             ):
                 yield None, {"line": line_number, "reason": "bad_index_record"}
@@ -206,7 +208,9 @@ def sanitize_usage(usage):
             or value < 0
         ):
             return None
-        if isinstance(value, float) and value.is_integer():
+        if isinstance(value, float):
+            if not value.is_integer():
+                return None
             value = int(value)
         sanitized[key] = value
     return sanitized
@@ -244,13 +248,50 @@ def valid_messages(messages):
     return True
 
 
+def json_serializable(value):
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def valid_function_payload(function, require_arguments=False):
+    if not isinstance(function, dict):
+        return False
+    if not isinstance(function.get("name"), str) or not function.get("name"):
+        return False
+    if "arguments" in function and not isinstance(function.get("arguments"), str):
+        return False
+    if require_arguments and "arguments" in function and not isinstance(function.get("arguments"), str):
+        return False
+    for optional_key in ("description", "parameters"):
+        if optional_key in function and not json_serializable(function[optional_key]):
+            return False
+    return True
+
+
 def valid_tools(tools):
     if not isinstance(tools, list):
         return False
     for tool in tools:
         if not isinstance(tool, dict):
             return False
+        if tool.get("type") != "function":
+            return False
+        if not valid_function_payload(tool.get("function")):
+            return False
     return True
+
+
+def valid_tool_call(tool_call):
+    if not isinstance(tool_call, dict):
+        return False
+    if not isinstance(tool_call.get("id"), str) or not tool_call.get("id"):
+        return False
+    if tool_call.get("type") != "function":
+        return False
+    return valid_function_payload(tool_call.get("function"), require_arguments=True)
 
 
 def valid_response_message(message):
@@ -263,7 +304,7 @@ def valid_response_message(message):
         if not isinstance(tool_calls, list):
             return False
         for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
+            if not valid_tool_call(tool_call):
                 return False
     return True
 
@@ -618,8 +659,10 @@ def call_label_model(router_record, config, urlopen=None):
 
 def final_route_label(canonical):
     model_label = normalize_model_label(canonical["routing"].get("model_label"))
-    if model_label and model_label["confidence"] >= 0.75:
-        return model_label["label"], "high"
+    if model_label:
+        if model_label["confidence"] >= 0.75:
+            return model_label["label"], "high"
+        return model_label["label"], "low"
     rule_label = classify_by_rules(canonical)
     if rule_label in ROUTE_LABELS:
         return rule_label, "medium"
