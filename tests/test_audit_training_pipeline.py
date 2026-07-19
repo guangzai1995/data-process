@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -24,7 +25,25 @@ def load_pipeline_module():
 class PipelineImportTest(unittest.TestCase):
     def test_pipeline_version_is_declared(self):
         pipeline = load_pipeline_module()
-        self.assertEqual(pipeline.PIPELINE_VERSION, "2026.07.16")
+        self.assertEqual(pipeline.PIPELINE_VERSION, "2026.07.19")
+
+    def test_readme_documents_selected_outputs_and_explicit_labelers(self):
+        readme = (REPO_ROOT / "audit_training" / "README.md").read_text(encoding="utf-8")
+        script = REPO_ROOT / "scripts" / "run_audit_training_pipeline.sh"
+        self.assertTrue(script.exists())
+        for token in [
+            "selected/sft/<date>.jsonl",
+            "quality/<date>.jsonl",
+            "episodes/<date>.jsonl",
+            "--enable-route-labeler",
+            "--enable-quality-labeler",
+            "--enable-label-snippets",
+            "--disable-selection",
+            "--compat-output-set",
+            "AUDIT_SELECTION_HMAC_KEY",
+        ]:
+            self.assertIn(token, readme)
+        self.assertIn("Environment variables alone do not trigger external calls", readme)
 
 
 class CliTest(unittest.TestCase):
@@ -71,7 +90,7 @@ class CliTest(unittest.TestCase):
         pipeline = load_pipeline_module()
         calls = []
 
-        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False, **kwargs):
             calls.append((input_root, output_root, date, limit, dry_run))
             return {"date": date, "accepted": 1}
 
@@ -115,7 +134,7 @@ class CliTest(unittest.TestCase):
         pipeline = load_pipeline_module()
         calls = []
 
-        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False, **kwargs):
             calls.append(date)
             return {"date": date}
 
@@ -152,7 +171,7 @@ class CliTest(unittest.TestCase):
     def test_main_rejects_non_standard_json_stdout(self):
         pipeline = load_pipeline_module()
 
-        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False):
+        def fake_process_date(input_root, output_root, date, limit=None, dry_run=False, **kwargs):
             return {"date": date, "score": math.nan}
 
         pipeline.process_date = fake_process_date
@@ -210,6 +229,21 @@ class RedactionTest(unittest.TestCase):
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+
+def read_jsonl(path):
+    text = path.read_text(encoding="utf-8")
+    if not text:
+        return []
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def write_index(day, entries):
+    day.mkdir(parents=True, exist_ok=True)
+    (day / "_request_index.jsonl").write_text(
+        "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
 
 
 class AuditReadTest(unittest.TestCase):
@@ -1078,7 +1112,12 @@ class ExporterTest(unittest.TestCase):
         )
         queue = outputs["label_queue/2026-07-15.jsonl"]
         self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["router"]["labels"]["final_label"], "tool_agent")
+        dumped = json.dumps(queue[0], ensure_ascii=False)
+        self.assertEqual(queue[0]["reason"], "low_confidence_route")
+        self.assertIn("features", queue[0])
+        self.assertNotIn("sample_id", dumped)
+        self.assertNotIn("input", dumped)
+        self.assertNotIn("router", dumped)
 
 
     def test_export_sft_rebuilds_messages_as_text_only(self):
@@ -1264,7 +1303,14 @@ class LabelModelTest(unittest.TestCase):
 
     def test_call_label_model_parses_successful_response(self):
         pipeline = load_pipeline_module()
-        router_record = {"input": "use a tool"}
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        payload, payload_error = pipeline.build_route_label_payload(canonical, allow_snippets=False)
+        self.assertIsNone(payload_error)
         calls = []
 
         class FakeResponse(object):
@@ -1295,13 +1341,17 @@ class LabelModelTest(unittest.TestCase):
             body = json.loads(request.data.decode("utf-8"))
             self.assertEqual(body["model"], "label-model")
             self.assertEqual(body["temperature"], 0)
-            self.assertGreaterEqual(len(body["messages"]), 2)
-            self.assertEqual(body["messages"][0]["role"], "system")
-            self.assertEqual(body["messages"][1]["role"], "user")
             prompt = json.loads(body["messages"][1]["content"])
+            dumped = json.dumps(prompt, ensure_ascii=False)
             self.assertEqual(prompt["task"], "classify_route")
             self.assertIn("tool_agent", prompt["labels"])
-            self.assertEqual(prompt["sample"], router_record)
+            self.assertIn("features", prompt["sample"])
+            self.assertNotIn("input", dumped)
+            self.assertNotIn("messages", dumped)
+            self.assertNotIn("sample_id", dumped)
+            self.assertNotIn("request-1", dumped)
+            self.assertNotIn("tenant_hash", dumped)
+            self.assertNotIn("13800138000", dumped)
             return FakeResponse()
 
         config = {
@@ -1312,7 +1362,7 @@ class LabelModelTest(unittest.TestCase):
             "timeout": 12,
         }
         parsed, error = pipeline.call_label_model(
-            router_record, config, urlopen=fake_urlopen
+            payload, config, urlopen=fake_urlopen
         )
         self.assertIsNone(error)
         self.assertEqual(parsed["label"], "tool_agent")
@@ -1401,6 +1451,675 @@ class LabelModelTest(unittest.TestCase):
                 self.assertIsNone(parsed)
                 self.assertEqual(error, "labeler_invalid_response")
 
+
+
+class SelectionPipelineTest(unittest.TestCase):
+    FORBIDDEN_SELECTED_KEYS = set([
+        "sample_id",
+        "request_id",
+        "file_path_hash",
+        "tenant_hash",
+        "user_hash",
+        "session_hash",
+        "task_fingerprint_internal",
+        "content_hash",
+        "index_order",
+    ])
+
+    def assert_no_forbidden_selected_fields(self, value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self.assertNotIn(key, self.FORBIDDEN_SELECTED_KEYS)
+                self.assert_no_forbidden_selected_fields(item)
+        elif isinstance(value, list):
+            for item in value:
+                self.assert_no_forbidden_selected_fields(item)
+
+    def test_parse_args_accepts_selection_controls_and_rejects_conflicts(self):
+        pipeline = load_pipeline_module()
+        args = pipeline.parse_args([
+            "--date", "2026-07-15",
+            "--disable-episodes",
+            "--selection-mode", "spool",
+            "--max-in-memory-samples", "0",
+            "--max-selection-memory-mb", "1",
+            "--enable-route-labeler",
+            "--enable-quality-labeler",
+            "--enable-label-snippets",
+        ])
+        self.assertTrue(args.disable_episodes)
+        self.assertEqual(args.selection_mode, "spool")
+        self.assertEqual(args.max_in_memory_samples, 0)
+        self.assertTrue(args.enable_route_labeler)
+        self.assertTrue(args.enable_quality_labeler)
+        self.assertTrue(args.enable_label_snippets)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                pipeline.parse_args(["--date", "2026-07-15", "--compat-output-set", "--enable-quality-labeler"])
+
+    def test_route_label_payload_is_feature_only_by_default(self):
+        pipeline = load_pipeline_module()
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            sample_success_record(),
+        )
+        self.assertIsNone(reject)
+        payload, reason = pipeline.build_route_label_payload(canonical, allow_snippets=False)
+        dumped = json.dumps(payload, ensure_ascii=False)
+        self.assertIsNone(reason)
+        self.assertEqual(payload["task"], "classify_route")
+        self.assertNotIn("input", dumped)
+        self.assertNotIn("messages", dumped)
+        self.assertNotIn("sample_id", dumped)
+        self.assertNotIn("request-1", dumped)
+        self.assertNotIn("tenant", dumped)
+        self.assertNotIn("13800138000", dumped)
+        self.assertIn("features", payload["sample"])
+
+    def test_leakage_scan_rejects_urls_paths_and_long_literals(self):
+        pipeline = load_pipeline_module()
+        rejected = [
+            "see https://example.com/a",
+            "open /var/log/private/app.log",
+            "token abcdef1234567890abcdef1234567890abcdef12",
+            "```python\nprint('secret')\n```",
+            "<EMAIL_1>",
+        ]
+        for text in rejected:
+            with self.subTest(text=text):
+                ok, reason = pipeline.leakage_scan_text(text, max_chars=200)
+                self.assertFalse(ok)
+                self.assertTrue(reason)
+        ok, reason = pipeline.leakage_scan_text("请总结这个订单问题", max_chars=200)
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+
+    def test_process_date_writes_selected_quality_episode_reports_without_forbidden_fields(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            first = sample_success_record()
+            first["request_body"]["messages"] = [{"role": "user", "content": "请写一段 Python 代码，打印 hello"}]
+            second = sample_success_record()
+            second["request_id"] = "request-2"
+            second["timestamp"] = "2026-07-15T00:05:00+08:00"
+            second["request_body"]["messages"] = [
+                {"role": "user", "content": "继续上面的 Python 代码，增加参数校验"}
+            ]
+            second["response_body"]["choices"][0]["message"]["content"] = "可以增加 if not name: raise ValueError('name')"
+            write_json(day / "u" / "s" / "001.json", first)
+            write_json(day / "u" / "s" / "002.json", second)
+            write_index(day, [
+                {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                {"request_id": "request-2", "file_path": "2026-07-15/u/s/002.json"},
+            ])
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            self.assertEqual(result["accepted"], 2)
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            selected_router = read_jsonl(output_root / "selected" / "router_classification" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            episodes = read_jsonl(output_root / "episodes" / "2026-07-15.jsonl")
+            manifest = json.loads((output_root / "reports" / "2026-07-15.selection_manifest.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(selected_sft), 1)
+            self.assertEqual(len(selected_router), 2)
+            self.assertEqual(len(quality), 2)
+            self.assertEqual(len(episodes), 1)
+            self.assertIn("selected/sft", manifest["output_matrix"]["enabled_outputs"])
+            for record in selected_sft + selected_router:
+                self.assert_no_forbidden_selected_fields(record)
+                self.assertEqual(record["schema_version"], pipeline.SELECTED_SCHEMA_VERSION)
+            self.assertIn("schema_versions", manifest)
+
+    def test_low_value_greetings_are_filtered_from_selected_not_legacy(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["request_body"]["messages"] = [{"role": "user", "content": "你好"}]
+            raw["response_body"]["choices"][0]["message"]["content"] = "你好"
+            write_json(day / "u" / "s" / "001.json", raw)
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            legacy_sft = read_jsonl(output_root / "sft" / "2026-07-15.jsonl")
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(legacy_sft), 1)
+            self.assertEqual(selected_sft, [])
+            self.assertIn("greeting_or_probe", quality[0]["reject_reasons"])
+
+    def test_selected_tool_use_requires_json_object_arguments(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "[]"}}
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        annotated = pipeline.annotate_task_and_quality(canonical, pipeline.default_selection_config())
+        self.assertIsNone(pipeline.export_selected_tool_use_sft(annotated))
+        self.assertIn("invalid_selected_tool_trace", annotated["quality"]["reject_reasons"])
+
+    def test_disable_selection_keeps_legacy_outputs_only(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", disable_selection=True)
+
+            self.assertEqual(result["accepted"], 1)
+            self.assertTrue((output_root / "sft" / "2026-07-15.jsonl").exists())
+            self.assertFalse((output_root / "selected" / "sft" / "2026-07-15.jsonl").exists())
+            self.assertFalse((output_root / "quality" / "2026-07-15.jsonl").exists())
+            self.assertFalse((output_root / "episodes" / "2026-07-15.jsonl").exists())
+
+    def test_auto_selection_spools_and_cleans_temp_on_dry_run(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            result = pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                dry_run=True,
+                max_in_memory_samples=0,
+                selection_mode="auto",
+            )
+
+            self.assertEqual(result["selection"]["mode_used"], "spool")
+            self.assertFalse((output_root / ".tmp").exists())
+            self.assertFalse((output_root / "selected" / "sft" / "2026-07-15.jsonl").exists())
+
+    def test_active_lock_prevents_concurrent_runs(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+            locks = output_root / ".tmp" / "locks"
+            locks.mkdir(parents=True)
+            (locks / "2026-07-15.lock").write_text(
+                json.dumps({"pid": os.getpid(), "run_id": "active", "started_at": "2026-07-15T00:00:00Z"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(RuntimeError):
+                pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+
+class SelectionHardeningTest(unittest.TestCase):
+    def test_quality_model_high_score_cannot_rescue_hard_reject(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": '{"quality_score":0.99,"value_labels":["code_task"],"risk_labels":[],"reason":"high"}'}}]
+                }).encode("utf-8")
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = lambda request, timeout=None: FakeResponse()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                raw = sample_success_record()
+                raw["request_body"]["messages"] = [{"role": "user", "content": "你好"}]
+                raw["response_body"]["choices"][0]["message"]["content"] = "你好"
+                write_json(day / "u" / "s" / "001.json", raw)
+                write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+                pipeline.process_date(
+                    str(input_root),
+                    str(output_root),
+                    "2026-07-15",
+                    enable_quality_labeler=True,
+                )
+
+                selected = read_jsonl(output_root / "selected" / "router_classification" / "2026-07-15.jsonl")
+                quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")[0]
+                self.assertEqual(selected, [])
+                self.assertEqual(quality["quality"]["deterministic_quality_score"], 0.2)
+                self.assertEqual(quality["quality"]["final_quality_score"], 0.2)
+                self.assertIn("greeting_or_probe", quality["reject_reasons"])
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_quality_model_risk_removes_selected_eligibility(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": '{"quality_score":0.95,"value_labels":[],"risk_labels":["redaction_risk"],"reason":"risk"}'}}]
+                }).encode("utf-8")
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = lambda request, timeout=None: FakeResponse()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                raw = sample_success_record()
+                raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码打印 hello"}]
+                write_json(day / "u" / "s" / "001.json", raw)
+                write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+                pipeline.process_date(
+                    str(input_root),
+                    str(output_root),
+                    "2026-07-15",
+                    enable_quality_labeler=True,
+                )
+
+                selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+                quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")[0]
+                self.assertEqual(selected, [])
+                self.assertIn("model_risk", quality["reject_reasons"])
+                self.assertIn("redaction_risk", quality["quality"]["risk_labels"])
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_episode_grouping_splits_gap_and_marks_missing_session_fallback(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config()
+        first_raw = sample_success_record()
+        second_raw = sample_success_record()
+        second_raw["request_id"] = "request-2"
+        second_raw["timestamp"] = "2026-07-15T00:45:00+08:00"
+        third_raw = sample_success_record()
+        third_raw["request_id"] = "request-3"
+        third_raw["session_id"] = ""
+        third_raw["timestamp"] = "2026-07-15T00:05:00+08:00"
+        records = []
+        for index, raw in enumerate([first_raw, second_raw, third_raw], 1):
+            canonical, reject = pipeline.build_canonical_sample(
+                "2026-07-15",
+                {"request_id": raw["request_id"], "file_path": "2026-07-15/u/s/%03d.json" % index, "_index_line": index},
+                raw,
+            )
+            self.assertIsNone(reject)
+            records.append(pipeline.annotate_task_and_quality(canonical, config))
+        episodes = pipeline.build_episodes(records, config)
+        self.assertEqual([episode["turn_count"] for episode in episodes], [1, 1, 1])
+        self.assertTrue(any(episode["missing_session_fallback"] for episode in episodes))
+        self.assertFalse(any(episode["eligible_for_selected_multi_turn"] for episode in episodes))
+
+    def test_selected_tool_trace_rejects_unknown_tool_and_malformed_arguments(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        cases = [
+            ("unknown", {"id": "call_1", "type": "function", "function": {"name": "missing", "arguments": "{}"}}),
+            ("malformed", {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{bad json}"}}),
+            ("scalar", {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": '"x"'}}),
+        ]
+        for name, tool_call in cases:
+            with self.subTest(name=name):
+                current = copy.deepcopy(raw)
+                current["response_body"]["choices"][0]["message"] = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tool_call],
+                }
+                canonical, reject = pipeline.build_canonical_sample(
+                    "2026-07-15",
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                    current,
+                )
+                self.assertIsNone(reject)
+                annotated = pipeline.annotate_task_and_quality(canonical, config)
+                self.assertIsNone(pipeline.export_selected_tool_use_sft(annotated))
+                self.assertIn("invalid_selected_tool_trace", annotated["quality"]["reject_reasons"])
+
+    def test_reject_reports_are_non_linkable(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["status"] = "failed"
+            write_json(day / "tenant-1" / "user-1" / "s" / "001.json", raw)
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/tenant-1/user-1/s/001.json"}])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            reject_text = (output_root / "reports" / "2026-07-15.rejects.jsonl").read_text(encoding="utf-8")
+            reject = json.loads(reject_text)
+            self.assertEqual(reject["reason"], "status_not_success")
+            self.assertNotIn("request_id", reject_text)
+            self.assertNotIn("file_path_hash", reject_text)
+            self.assertNotIn("tenant-1", reject_text)
+
+    def test_selected_min_score_is_global_gate(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["request_body"]["messages"] = [{"role": "user", "content": "解释一下"}]
+            raw["response_body"]["choices"][0]["message"]["content"] = "这是一个简短解释。"
+            write_json(day / "u" / "s" / "001.json", raw)
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                selected_min_score=0.7,
+                router_min_score=0.1,
+            )
+
+            selected = read_jsonl(output_root / "selected" / "router_classification" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")[0]
+            self.assertEqual(selected, [])
+            self.assertEqual(quality["quality"]["use_for"], [])
+
+    def test_spool_mode_does_not_call_in_memory_selection_builders(self):
+        pipeline = load_pipeline_module()
+        original_build_episodes = pipeline.build_episodes
+        try:
+            def forbidden_build_episodes(records, config):
+                raise AssertionError("spool mode must not route through in-memory episode builder")
+            pipeline.build_episodes = forbidden_build_episodes
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                for index in range(2):
+                    raw = sample_success_record()
+                    raw["request_id"] = "request-%d" % index
+                    raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码 %d" % index}]
+                    write_json(day / "u" / "s" / ("%03d.json" % index), raw)
+                write_index(day, [
+                    {"request_id": "request-0", "file_path": "2026-07-15/u/s/000.json"},
+                    {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                ])
+
+                result = pipeline.process_date(
+                    str(input_root),
+                    str(output_root),
+                    "2026-07-15",
+                    selection_mode="spool",
+                )
+
+                self.assertEqual(result["selection"]["mode_used"], "spool")
+                self.assertEqual(result["selection"]["candidate_count"], 2)
+                self.assertFalse((output_root / ".tmp").exists())
+        finally:
+            pipeline.build_episodes = original_build_episodes
+
+    def test_missing_event_time_records_do_not_merge_into_episode(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config()
+        records = []
+        for index in range(2):
+            raw = sample_success_record()
+            raw.pop("timestamp", None)
+            raw.pop("timestamp_ms", None)
+            raw["request_id"] = "request-%d" % index
+            canonical, reject = pipeline.build_canonical_sample(
+                "2026-07-15",
+                {"request_id": raw["request_id"], "file_path": "2026-07-15/u/s/%03d.json" % index, "_index_line": index},
+                raw,
+            )
+            self.assertIsNone(reject)
+            records.append(pipeline.annotate_task_and_quality(canonical, config))
+        episodes = pipeline.build_episodes(records, config)
+        self.assertEqual([episode["turn_count"] for episode in episodes], [1, 1])
+        self.assertTrue(all(episode["index_order_only"] for episode in episodes))
+
+    def test_label_payload_buckets_unknown_model_and_client_type(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["model"] = "tenant-secret-model-v1"
+        raw["request_body"]["model"] = "tenant-secret-model-v1"
+        raw["client_type"] = "tenant-secret-client"
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        payload, error = pipeline.build_route_label_payload(canonical, allow_snippets=False)
+        self.assertIsNone(error)
+        dumped = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("tenant-secret", dumped)
+        self.assertEqual(payload["sample"]["features"]["model_bucket"], "other")
+        self.assertEqual(payload["sample"]["features"]["client_type_bucket"], "other")
+
+    def test_tool_result_must_follow_prior_assistant_tool_call(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        ]
+        raw["request_body"]["messages"] = [
+            {"role": "user", "content": "查一下"},
+            {"role": "tool", "tool_call_id": "call_old", "content": "result before call"},
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        annotated = pipeline.annotate_task_and_quality(canonical, pipeline.default_selection_config())
+        self.assertIsNone(pipeline.export_selected_tool_use_sft(annotated))
+        self.assertIn("invalid_selected_tool_trace", annotated["quality"]["reject_reasons"])
+
+    def test_high_value_task_quota_limits_selected_sft_per_task(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            first = sample_success_record()
+            second = sample_success_record()
+            second["request_id"] = "request-2"
+            for raw, response in [
+                (first, "print('hello 1')"),
+                (second, "print('hello 2')"),
+            ]:
+                raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码打印 hello"}]
+                raw["response_body"]["choices"][0]["message"]["content"] = response
+            write_json(day / "u" / "s" / "001.json", first)
+            write_json(day / "u" / "s" / "002.json", second)
+            write_index(day, [
+                {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+                {"request_id": "request-2", "file_path": "2026-07-15/u/s/002.json"},
+            ])
+
+            pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                max_high_value_per_task_fingerprint_per_day=1,
+            )
+
+            selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(selected), 1)
+            self.assertTrue(any("quota_exceeded" in item["quality"]["risk_labels"] for item in quality))
+
+    def test_tool_result_before_matching_assistant_call_is_rejected_even_if_final_call_matches(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        ]
+        raw["request_body"]["messages"] = [
+            {"role": "user", "content": "查一下"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result before call"},
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        annotated = pipeline.annotate_task_and_quality(canonical, pipeline.default_selection_config())
+        self.assertIsNone(pipeline.export_selected_tool_use_sft(annotated))
+        self.assertIn("invalid_selected_tool_trace", annotated["quality"]["reject_reasons"])
+
+    def test_tool_trace_rejects_duplicate_call_ids_across_history_and_response(self):
+        pipeline = load_pipeline_module()
+        raw = sample_success_record()
+        raw["request_body"]["tools"] = [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        ]
+        raw["request_body"]["messages"] = [
+            {"role": "user", "content": "查一下"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "historical result"},
+        ]
+        raw["response_body"]["choices"][0]["finish_reason"] = "tool_calls"
+        raw["response_body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ],
+        }
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        annotated = pipeline.annotate_task_and_quality(canonical, pipeline.default_selection_config())
+        self.assertIsNone(pipeline.export_selected_tool_use_sft(annotated))
+        self.assertIn("invalid_selected_tool_trace", annotated["quality"]["reject_reasons"])
+
+    def test_compat_and_disable_diagnostics_output_matrices(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            compat_root = root / "compat"
+            diag_root = root / "diag"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码"}]
+            write_json(day / "u" / "s" / "001.json", raw)
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            pipeline.process_date(str(input_root), str(compat_root), "2026-07-15", compat_output_set=True)
+            self.assertTrue((compat_root / "sft" / "2026-07-15.jsonl").exists())
+            self.assertFalse((compat_root / "selected" / "sft" / "2026-07-15.jsonl").exists())
+            self.assertFalse((compat_root / "reports" / "2026-07-15.selection_manifest.json").exists())
+
+            pipeline.process_date(str(input_root), str(diag_root), "2026-07-15", disable_diagnostics=True)
+            self.assertFalse((diag_root / "canonical" / "2026-07-15.jsonl").exists())
+            self.assertFalse((diag_root / "quality" / "2026-07-15.jsonl").exists())
+            self.assertFalse((diag_root / "episodes" / "2026-07-15.jsonl").exists())
+            self.assertTrue((diag_root / "selected" / "sft" / "2026-07-15.jsonl").exists())
+            manifest = json.loads((diag_root / "reports" / "2026-07-15.selection_manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["output_matrix"]["disable_diagnostics"])
 
 
 class PipelineRunTest(unittest.TestCase):
@@ -1543,7 +2262,8 @@ class PipelineRunTest(unittest.TestCase):
             canonical = json.loads(canonical_text)
             reject = json.loads(rejects_text)
             self.assertIn("file_path_hash", canonical["source"])
-            self.assertIn("file_path_hash", reject)
+            self.assertNotIn("file_path_hash", reject)
+            self.assertNotIn("request_id", reject)
 
     def test_process_date_rejects_detail_with_non_standard_json_constant(self):
         pipeline = load_pipeline_module()
@@ -1615,6 +2335,43 @@ class PipelineRunTest(unittest.TestCase):
             canonical_lines = (output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(canonical_lines), 1)
 
+    def test_process_date_route_labeler_requires_explicit_flag(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        def forbidden_urlopen(request, timeout=None):
+            raise AssertionError("route labeler should be disabled without explicit flag")
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = forbidden_urlopen
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                write_json(day / "u" / "s" / "001.json", sample_success_record())
+                write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+                pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+                canonical = read_jsonl(output_root / "canonical" / "2026-07-15.jsonl")[0]
+                router = read_jsonl(output_root / "router_classification" / "2026-07-15.jsonl")[0]
+                self.assertIsNone(canonical["routing"]["model_label"])
+                self.assertIsNone(router["labels"]["model_label"])
+                self.assertEqual(router["labels"]["final_label"], "code_generation")
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_process_date_applies_successful_labeler_to_canonical_and_router(self):
         pipeline = load_pipeline_module()
         old_env = os.environ.copy()
@@ -1654,7 +2411,7 @@ class PipelineRunTest(unittest.TestCase):
                     json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
                     encoding="utf-8",
                 )
-                pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                pipeline.process_date(str(input_root), str(output_root), "2026-07-15", enable_route_labeler=True)
                 canonical = json.loads((output_root / "canonical" / "2026-07-15.jsonl").read_text(encoding="utf-8"))
                 router = json.loads((output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8"))
                 self.assertEqual(canonical["routing"]["model_label"], {"label": "tool_agent", "confidence": 0.91})
@@ -1702,7 +2459,7 @@ class PipelineRunTest(unittest.TestCase):
                     json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
                     encoding="utf-8",
                 )
-                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", enable_route_labeler=True)
                 router_text = (output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8")
                 router = json.loads(router_text)
                 self.assertEqual(result["accepted"], 1)
@@ -1735,7 +2492,7 @@ class PipelineRunTest(unittest.TestCase):
                     json.dumps({"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}) + "\n",
                     encoding="utf-8",
                 )
-                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+                result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15", enable_route_labeler=True)
                 router_text = (output_root / "router_classification" / "2026-07-15.jsonl").read_text(encoding="utf-8")
                 router = json.loads(router_text)
                 self.assertEqual(result["accepted"], 1)
