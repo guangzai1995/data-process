@@ -4,8 +4,12 @@
 # Repository metadata and documentation.
 !.gitignore
 !README.md
+!.env.example
 !docs/
 !docs/**
+
+# Local secrets.
+.env
 
 # Processing code, configs, and tests.
 !scripts/

@@ -58,3 +58,31 @@ AUDIT_LABEL_TIMEOUT
 ```
 
 Labeling currently runs sequentially in the streaming pipeline. If the labeler is disabled, unreachable, or returns an invalid response, the sample still exports with rule-based routing and no raw prompt or exception detail is written to outputs.
+
+## Synthetic Samples
+
+Safe synthetic generation uses `scripts/synthesize_training_samples.py` and does not read `/isos_data_share/audit` or send real audit-derived content to DeepSeek.
+
+Create a local `.env` from `.env.example`:
+
+```text
+DEEPSEEK_API_KEY=your-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_TIMEOUT=30
+```
+
+Run:
+
+```bash
+scripts/run_synthetic_samples.sh --target-count 20 --batch-size 5
+```
+
+Outputs are written under:
+
+```text
+audit_training/synthetic_samples/samples.jsonl
+audit_training/synthetic_samples/state.json
+```
+
+The writer appends one JSONL record at a time and updates `state.json` after each accepted sample. You can stop it with `Ctrl+C` and run the same command again to resume from existing `sample_id` values. Generated synthetic outputs and `.env` are ignored by Git.
