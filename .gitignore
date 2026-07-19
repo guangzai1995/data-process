@@ -4,6 +4,7 @@
 # Repository metadata and documentation.
 !.gitignore
 !README.md
+!AGENTS.md
 !.env.example
 !docs/
 !docs/**
