@@ -1683,6 +1683,81 @@ class SelectionPipelineTest(unittest.TestCase):
                 pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
 
 
+class SelectionDedupeTest(unittest.TestCase):
+    def test_normalize_for_dedupe_replaces_numbers_paths_urls_and_placeholders(self):
+        pipeline = load_pipeline_module()
+        text = "  请修复 /tmp/app-123.py 第 42 行，见 https://example.com/a?id=9 <SECRET_1>  "
+        normalized = pipeline.normalize_for_dedupe(text)
+        self.assertEqual(
+            normalized,
+            "请修复 <path> 第 <num> 行 见 <url> <redacted>",
+        )
+
+    def test_simhash_helpers_are_stable_and_measure_distance(self):
+        pipeline = load_pipeline_module()
+        left = pipeline.simhash64(["python", "报错", "修复"])
+        right = pipeline.simhash64(["python", "报错", "修复"])
+        other = pipeline.simhash64(["发票", "订单", "查询"])
+        self.assertEqual(left, right)
+        self.assertEqual(pipeline.hamming_distance64(left, right), 0)
+        self.assertGreater(pipeline.hamming_distance64(left, other), 0)
+
+    def test_simhash_empty_tokens_returns_zero(self):
+        pipeline = load_pipeline_module()
+        self.assertEqual(pipeline.simhash64([]), 0)
+
+    def test_normalize_for_dedupe_treats_embedded_placeholder_urls_as_urls(self):
+        pipeline = load_pipeline_module()
+        normalized = pipeline.normalize_for_dedupe("见 https://example.com/<SECRET_1>?n=42")
+        self.assertEqual(normalized, "见 <url>")
+
+    def test_normalize_for_dedupe_treats_placeholder_path_segments_as_paths(self):
+        pipeline = load_pipeline_module()
+        normalized = pipeline.normalize_for_dedupe("打开 src/<SECRET_1>/app.py 和 foo/<PHONE_1>/bar.py")
+        self.assertEqual(normalized, "打开 <path> 和 <path>")
+
+    def test_normalize_for_dedupe_does_not_treat_ordinary_slash_phrases_as_paths(self):
+        pipeline = load_pipeline_module()
+        self.assertEqual(
+            pipeline.normalize_for_dedupe("请比较中文/英文句子的差异"),
+            "请比较中文 英文句子的差异",
+        )
+        self.assertEqual(
+            pipeline.normalize_for_dedupe("今天/明天都可以处理"),
+            "今天 明天都可以处理",
+        )
+        self.assertEqual(
+            pipeline.normalize_for_dedupe("please compare Chinese/English sentences"),
+            "please compare chinese english sentences",
+        )
+
+    def test_init_dedupe_state_uses_bounded_collections(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(max_dedupe_seen_hashes=3)
+        state = pipeline.init_dedupe_state(config)
+        self.assertEqual(state["max_seen_hashes"], 3)
+        self.assertIn("router_classification", state["seen"])
+        self.assertEqual(state["dedupe_counts"], {})
+        self.assertEqual(state["risk_counts"], {})
+
+    def test_dedupe_state_caps_mark_saturated_without_crashing(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(max_near_duplicate_representatives_per_bucket=0)
+        raw = sample_success_record()
+        raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 脚本读取 jsonl 文件并统计每个用户调用次数"}]
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            raw,
+        )
+        self.assertIsNone(reject)
+        annotated = pipeline.annotate_task_and_quality(canonical, config)
+        state = pipeline.init_dedupe_state(config)
+        pipeline.apply_dedupe_annotation(annotated, config, state)
+        self.assertIn("dedupe_state_saturated", annotated["quality"]["risk_labels"])
+        self.assertNotIn("near_duplicate_content", annotated["quality"]["reject_reasons"])
+
+
 class SelectionHardeningTest(unittest.TestCase):
     def test_quality_model_high_score_cannot_rescue_hard_reject(self):
         pipeline = load_pipeline_module()

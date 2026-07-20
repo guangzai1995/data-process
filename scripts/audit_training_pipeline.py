@@ -271,6 +271,65 @@ def normalize_text(text):
     return text
 
 
+def normalize_for_dedupe(text, max_chars=1200):
+    text = normalize_text(text)
+    if not text:
+        return ""
+    text = DEDUPE_URL_RE.sub(" <url> ", text)
+    text = DEDUPE_PATH_RE.sub(" <path> ", text)
+    text = DEDUPE_REDACTION_RE.sub(" <redacted> ", text)
+    text = DEDUPE_NUMBER_RE.sub(" <num> ", text)
+    text = DEDUPE_PUNCT_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    tokens = text.split()
+    collapsed = []
+    for token in tokens:
+        if collapsed and collapsed[-1] == token and token in DEBUG_CONTROL_TEXTS:
+            continue
+        collapsed.append(token)
+    return " ".join(collapsed)[:max_chars]
+
+
+def dedupe_tokens(text):
+    normalized = normalize_for_dedupe(text)
+    tokens = normalized.split()
+    grams = []
+    compact = normalized.replace(" ", "")
+    for index in range(max(0, len(compact) - 2)):
+        grams.append(compact[index:index + 3])
+    return tokens + grams
+
+
+def simhash64(tokens):
+    tokens = list(tokens)
+    if not tokens:
+        return 0
+    weights = [0] * 64
+    for token in tokens:
+        digest = int(hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16], 16)
+        for bit in range(64):
+            weights[bit] += 1 if digest & (1 << bit) else -1
+    value = 0
+    for bit, weight in enumerate(weights):
+        if weight >= 0:
+            value |= (1 << bit)
+    return value
+
+
+def hamming_distance64(left, right):
+    return bin(left ^ right).count("1")
+
+
+def jaccard_similarity(left_tokens, right_tokens):
+    left = set(left_tokens)
+    right = set(right_tokens)
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return float(len(left & right)) / float(len(left | right))
+
+
 def hmac_digest(value, key, length=16):
     if not key:
         return ""
@@ -665,10 +724,34 @@ RISK_LABELS = set([
     "duplicate",
     "quota_exceeded",
     "leakage_scan_failed",
+    "near_duplicate",
+    "debug_noise",
+    "debug_burst",
+    "dedupe_state_saturated",
 ])
 
 GREETING_TEXTS = set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽"])
 CONTINUATION_TERMS = ("继续", "上面", "上一", "刚才", "前面", "接着", "继续上面的", "that", "previous")
+DEDUPE_REDACTION_RE = re.compile(r"(?i)<[A-Z_]+_\d+>")
+DEDUPE_URL_RE = re.compile(r"(?i)\bhttps?://\S+")
+DEDUPE_PATH_SEGMENT = r"(?:[A-Za-z0-9_.-]+|<[A-Za-z_]+_\d+>)"
+DEDUPE_PATH_RE = re.compile(
+    r"(?:(?:^|\s)(?:/|\.\.?/|~[/\\]|[A-Za-z]:[\\/])\S+|"
+    r"(?:^|\s)" + DEDUPE_PATH_SEGMENT + r"(?:[/\\]" + DEDUPE_PATH_SEGMENT + r")*[/\\][A-Za-z0-9_.-]*\.[A-Za-z0-9_.-]+)"
+)
+DEDUPE_NUMBER_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?(?!\w)")
+DEDUPE_PUNCT_RE = re.compile(r"[，。！？；：、,.!?;:()/\\\[\]{}\"'`]+")
+DEBUG_CONTROL_TEXTS = set([
+    "continue", "retry", "again", "test", "ok", "yes", "no", "a", "b", "<num>", "1", "2",
+    "继续", "重试", "再来", "测试", "不对", "好的", "可以", "嗯", "是", "否",
+])
+DEDUPE_REJECT_REASONS = set([
+    "duplicate_content",
+    "normalized_duplicate_content",
+    "near_duplicate_content",
+    "debug_noise_repeat",
+    "debug_burst",
+])
 
 LEAKAGE_PATTERNS = [
     ("secret", re.compile(r"(?i)\b(?:bearer\s+)?(?:sk-|ak-|api[_-]?key[:=]?|secret[:=]?|token[:=]?)[A-Za-z0-9_\-]{12,}\b")),
@@ -785,6 +868,20 @@ def default_selection_config(**overrides):
         "disable_episodes": False,
         "disable_diagnostics": False,
         "compat_output_set": False,
+        "enable_dedupe": True,
+        "enable_near_duplicate_dedupe": True,
+        "enable_debug_noise_filter": True,
+        "near_duplicate_simhash_hamming": 4,
+        "near_duplicate_min_chars": 16,
+        "near_duplicate_min_tokens": 4,
+        "near_duplicate_jaccard": 0.88,
+        "max_near_duplicate_representatives_per_bucket": 128,
+        "max_debug_control_repeats_per_session": 2,
+        "max_debug_task_burst_per_session": 8,
+        "debug_burst_window_minutes": 20,
+        "max_dedupe_seen_hashes": 1000000,
+        "max_dedupe_user_session_windows": 100000,
+        "max_near_duplicate_buckets": 50000,
         "selection_hmac_key": os.environ.get("AUDIT_SELECTION_HMAC_KEY", ""),
     }
     for key, value in overrides.items():
@@ -2073,6 +2170,91 @@ def build_episodes(annotated_records, config=None):
     if current:
         episodes.append(build_episode_record(current))
     return episodes
+
+def init_dedupe_state(config):
+    return {
+        "seen": {"router_classification": set(), "sft": set(), "tool_use_sft": set()},
+        "prompt_by_bucket": {},
+        "representatives": {},
+        "session_control_counts": {},
+        "session_task_times": {},
+        "dedupe_counts": {},
+        "risk_counts": {},
+        "max_seen_hashes": config.get("max_dedupe_seen_hashes", 1000000),
+    }
+
+
+def add_unique_list_value(values, value):
+    if value not in values:
+        values.append(value)
+    return values
+
+
+def add_dedupe_count(state, name):
+    add_count(state["dedupe_counts"], name)
+
+
+def add_dedupe_risk(state, name):
+    add_count(state["risk_counts"], name)
+
+
+def mark_dedupe_saturated(canonical, state):
+    quality = canonical.setdefault("quality", {})
+    risks = quality.setdefault("risk_labels", [])
+    add_unique_list_value(risks, "dedupe_state_saturated")
+    quality["risk_labels"] = sorted(set(risks))
+    add_dedupe_risk(state, "dedupe_state_saturated")
+
+
+def can_add_state_key(mapping, key, max_keys, canonical, state):
+    if key in mapping:
+        return True
+    if len(mapping) < max_keys:
+        return True
+    mark_dedupe_saturated(canonical, state)
+    return False
+
+
+def apply_dedupe_annotation(canonical, config, state):
+    if not config.get("enable_dedupe", True):
+        return canonical
+    quality = canonical.setdefault("quality", {})
+    text = last_user_content(canonical.get("request", {}).get("messages") or [])
+    normalized = normalize_for_dedupe(text)
+    tokens = dedupe_tokens(text)
+    simhash = simhash64(tokens)
+    bucket = canonical.get("task", {}).get("task_bucket") or task_bucket_for(
+        canonical, config.get("selection_hmac_key")
+    )
+    quality["dedupe"] = {
+        "bucket": bucket,
+        "normalized_prompt_hash": content_hash(normalized)[:24],
+        "simhash64": "%016x" % simhash,
+        "token_count": len(tokens),
+    }
+    add_dedupe_count(state, "checked")
+    if not config.get("enable_near_duplicate_dedupe", True):
+        return canonical
+    if len(normalized) < config.get("near_duplicate_min_chars", 16):
+        return canonical
+    if len(tokens) < config.get("near_duplicate_min_tokens", 4):
+        return canonical
+    representatives = state.setdefault("representatives", {})
+    max_buckets = config.get("max_near_duplicate_buckets", 50000)
+    if not can_add_state_key(representatives, bucket, max_buckets, canonical, state):
+        return canonical
+    bucket_representatives = representatives.setdefault(bucket, [])
+    max_representatives = config.get("max_near_duplicate_representatives_per_bucket", 128)
+    if len(bucket_representatives) >= max_representatives:
+        mark_dedupe_saturated(canonical, state)
+        return canonical
+    bucket_representatives.append({
+        "normalized": normalized,
+        "tokens": tokens,
+        "simhash": simhash,
+    })
+    return canonical
+
 
 def add_count(counter, key):
     counter[key] = counter.get(key, 0) + 1
