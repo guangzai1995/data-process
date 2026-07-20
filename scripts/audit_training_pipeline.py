@@ -2174,6 +2174,7 @@ def build_episodes(annotated_records, config=None):
 def init_dedupe_state(config):
     return {
         "seen": {"router_classification": set(), "sft": set(), "tool_use_sft": set()},
+        "normalized": {"router_classification": set(), "sft": set(), "tool_use_sft": set()},
         "prompt_by_bucket": {},
         "representatives": {},
         "session_control_counts": {},
@@ -2215,23 +2216,69 @@ def can_add_state_key(mapping, key, max_keys, canonical, state):
     return False
 
 
+def dedupe_signature_for(kind, canonical):
+    text = normalize_for_dedupe(last_user_content(canonical.get("request", {}).get("messages") or []))
+    response = normalize_for_dedupe(extract_text_content(canonical.get("response", {}).get("message", {}).get("content")))
+    route = canonical.get("task", {}).get("route_label")
+    intent = canonical.get("task", {}).get("intent_label")
+    if kind == "sft":
+        return content_hash({"text": text, "response": response, "route": route, "intent": intent})
+    if kind == "tool_use_sft":
+        return content_hash({"text": text, "tools": sorted(tool_name_set(canonical)), "route": route, "intent": intent})
+    return content_hash({"text": text, "route": route, "intent": intent})
+
+
+def dedupe_bucket(canonical):
+    task = canonical.get("task", {})
+    quality = canonical.get("quality", {})
+    return "%s:%s:%s" % (
+        task.get("route_label") or "unknown",
+        task.get("intent_label") or "unknown",
+        quality.get("score_bucket") or "unknown",
+    )
+
+
+def mark_dedupe_suppression(canonical, state, reason, risk, kind):
+    quality = canonical.setdefault("quality", {})
+    dedupe = quality.setdefault("dedupe", {})
+    add_unique_list_value(dedupe.setdefault("suppressed_use_for", []), kind)
+    add_unique_list_value(dedupe.setdefault("matched_reasons", []), reason)
+    dedupe["matched_reason"] = reason
+    dedupe["decision"] = "suppressed"
+    quality["use_for"] = [value for value in quality.get("use_for", []) if value != kind]
+    add_unique_list_value(quality.setdefault("risk_labels", []), risk)
+    add_dedupe_count(state, reason)
+    add_dedupe_risk(state, risk)
+
+
+def finalize_dedupe_suppression(canonical):
+    quality = canonical.setdefault("quality", {})
+    dedupe = quality.setdefault("dedupe", {})
+    matched_reasons = dedupe.get("matched_reasons") or []
+    if matched_reasons and not quality.get("use_for"):
+        for reason in matched_reasons:
+            add_unique_list_value(quality.setdefault("reject_reasons", []), reason)
+        dedupe["decision"] = "rejected"
+
+
 def apply_dedupe_annotation(canonical, config, state):
-    if not config.get("enable_dedupe", True):
-        return canonical
     quality = canonical.setdefault("quality", {})
     text = last_user_content(canonical.get("request", {}).get("messages") or [])
     normalized = normalize_for_dedupe(text)
     tokens = dedupe_tokens(text)
     simhash = simhash64(tokens)
-    bucket = canonical.get("task", {}).get("task_bucket") or task_bucket_for(
+    near_bucket = canonical.get("task", {}).get("task_bucket") or task_bucket_for(
         canonical, config.get("selection_hmac_key")
     )
     quality["dedupe"] = {
-        "bucket": bucket,
+        "bucket": dedupe_bucket(canonical),
         "normalized_prompt_hash": content_hash(normalized)[:24],
         "simhash64": "%016x" % simhash,
         "token_count": len(tokens),
+        "decision": "checked",
     }
+    if not config.get("enable_dedupe", True) or quality.get("reject_reasons"):
+        return canonical
     add_dedupe_count(state, "checked")
     if not config.get("enable_near_duplicate_dedupe", True):
         return canonical
@@ -2241,9 +2288,9 @@ def apply_dedupe_annotation(canonical, config, state):
         return canonical
     representatives = state.setdefault("representatives", {})
     max_buckets = config.get("max_near_duplicate_buckets", 50000)
-    if not can_add_state_key(representatives, bucket, max_buckets, canonical, state):
+    if not can_add_state_key(representatives, near_bucket, max_buckets, canonical, state):
         return canonical
-    bucket_representatives = representatives.setdefault(bucket, [])
+    bucket_representatives = representatives.setdefault(near_bucket, [])
     max_representatives = config.get("max_near_duplicate_representatives_per_bucket", 128)
     if len(bucket_representatives) >= max_representatives:
         mark_dedupe_saturated(canonical, state)
@@ -2254,6 +2301,14 @@ def apply_dedupe_annotation(canonical, config, state):
         "simhash": simhash,
     })
     return canonical
+
+
+def apply_dedupe_annotations_to_records(annotated_records, config):
+    state = init_dedupe_state(config)
+    for canonical in sorted(annotated_records, key=selection_rank_key):
+        refresh_selection_use_for(canonical, config)
+        apply_dedupe_annotation(canonical, config, state)
+    return state
 
 
 def add_count(counter, key):
@@ -2409,7 +2464,16 @@ def init_selected_export_state():
     }
 
 
-def consider_selected_record(canonical, config, state):
+def suppress_selected_duplicate(canonical, dedupe_state, reason, kind):
+    if dedupe_state is None:
+        quality = canonical.setdefault("quality", {})
+        add_unique_list_value(quality.setdefault("risk_labels", []), "duplicate")
+        return
+    mark_dedupe_suppression(canonical, dedupe_state, reason, "duplicate", kind)
+    finalize_dedupe_suppression(canonical)
+
+
+def consider_selected_record(canonical, config, state, dedupe_state=None):
     quality = canonical.get("quality", {})
     if quality.get("reject_reasons"):
         return
@@ -2421,11 +2485,6 @@ def consider_selected_record(canonical, config, state):
         ("tool_use_sft", export_selected_tool_use_sft, "max_selected_tool_use_per_user_per_day"),
     ):
         if kind not in quality.get("use_for", []):
-            continue
-        key = selected_duplicate_key(kind, canonical)
-        if key in state["seen"][kind]:
-            if "duplicate" not in quality.setdefault("risk_labels", []):
-                quality["risk_labels"].append("duplicate")
             continue
         user_count_key = "%s:%s" % (kind, user_key)
         task_count_key = "%s:%s" % (kind, task_key)
@@ -2442,11 +2501,23 @@ def consider_selected_record(canonical, config, state):
             if "quota_exceeded" not in quality.setdefault("risk_labels", []):
                 quality["risk_labels"].append("quota_exceeded")
             continue
+        key = selected_duplicate_key(kind, canonical)
+        normalized_key = dedupe_signature_for(kind, canonical)
+        if key in state["seen"][kind]:
+            suppress_selected_duplicate(canonical, dedupe_state, "duplicate_content", kind)
+            continue
+        if dedupe_state is not None and normalized_key in dedupe_state["normalized"][kind]:
+            suppress_selected_duplicate(canonical, dedupe_state, "normalized_duplicate_content", kind)
+            continue
         record = exporter(canonical)
         if record is None:
             continue
         state["outputs"][kind].append(record)
         state["seen"][kind].add(key)
+        if dedupe_state is not None:
+            normalized_seen = dedupe_state["normalized"][kind]
+            if can_add_state_key(normalized_seen, normalized_key, dedupe_state.get("max_seen_hashes", 1000000), canonical, dedupe_state):
+                normalized_seen.add(normalized_key)
         state["user_counts"][user_count_key] = state["user_counts"].get(user_count_key, 0) + 1
         state["task_counts"][task_count_key] = state["task_counts"].get(task_count_key, 0) + 1
         if quality.get("value_labels"):
@@ -2455,8 +2526,9 @@ def consider_selected_record(canonical, config, state):
 
 def build_selected_outputs(annotated_records, episodes, config):
     state = init_selected_export_state()
+    dedupe_state = init_dedupe_state(config)
     for canonical in sorted(annotated_records, key=selection_rank_key):
-        consider_selected_record(canonical, config, state)
+        consider_selected_record(canonical, config, state, dedupe_state)
     sample_by_id = {canonical.get("sample_id"): canonical for canonical in annotated_records}
     if not config.get("disable_episodes"):
         for episode in episodes:
@@ -2879,6 +2951,7 @@ def process_date(
                 annotated_records = []
                 episodes = []
             else:
+                apply_dedupe_annotations_to_records(annotated_records, config)
                 episodes = build_episodes(annotated_records, config)
                 selected_outputs = build_selected_outputs(annotated_records, episodes, config)
                 candidate_count = len(annotated_records)

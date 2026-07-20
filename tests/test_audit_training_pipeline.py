@@ -1757,6 +1757,158 @@ class SelectionDedupeTest(unittest.TestCase):
         self.assertIn("dedupe_state_saturated", annotated["quality"]["risk_labels"])
         self.assertNotIn("near_duplicate_content", annotated["quality"]["reject_reasons"])
 
+    def test_exact_selected_duplicate_is_filtered_from_selected_but_kept_in_legacy_and_quality(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            for index in range(2):
+                raw = sample_success_record()
+                raw["request_id"] = "request-%d" % index
+                raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码打印 hello"}]
+                raw["response_body"]["choices"][0]["message"]["content"] = "print('hello')"
+                write_json(day / "u" / "s" / ("%03d.json" % index), raw)
+            write_index(day, [
+                {"request_id": "request-0", "file_path": "2026-07-15/u/s/000.json"},
+                {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            ])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            legacy = read_jsonl(output_root / "sft" / "2026-07-15.jsonl")
+            selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(legacy), 2)
+            self.assertEqual(len(selected), 1)
+            self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
+            self.assertTrue(any("duplicate" in row["quality"]["risk_labels"] for row in quality))
+
+    def test_router_duplicate_does_not_filter_distinct_sft_response(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            for index, response in enumerate(["print('hello one')", "print('hello two')"]):
+                raw = sample_success_record()
+                raw["request_id"] = "request-%d" % index
+                raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码打印 hello"}]
+                raw["response_body"]["choices"][0]["message"]["content"] = response
+                write_json(day / "u" / "s" / ("%03d.json" % index), raw)
+            write_index(day, [
+                {"request_id": "request-0", "file_path": "2026-07-15/u/s/000.json"},
+                {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            ])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            selected_router = read_jsonl(output_root / "selected" / "router_classification" / "2026-07-15.jsonl")
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(selected_router), 1)
+            self.assertEqual(len(selected_sft), 2)
+            self.assertFalse(any("duplicate_content" in row["reject_reasons"] for row in quality))
+            self.assertTrue(any("duplicate" in row["quality"]["risk_labels"] for row in quality))
+
+    def test_apply_dedupe_annotation_does_not_write_selected_duplicate_state(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(router_min_score=1.0)
+        state = pipeline.init_dedupe_state(config)
+        records = []
+        for index, prompt in enumerate(["请修复第 42 行 Python 报错", "请修复第 43 行 Python 报错"]):
+            raw = sample_success_record()
+            raw["request_id"] = "request-%d" % index
+            raw["request_body"]["messages"] = [{"role": "user", "content": prompt}]
+            raw["response_body"]["choices"][0]["message"]["content"] = "可以检查异常栈并修复参数。"
+            canonical, reject = pipeline.build_canonical_sample(
+                "2026-07-15",
+                {"request_id": raw["request_id"], "file_path": "2026-07-15/u/s/%03d.json" % index},
+                raw,
+            )
+            self.assertIsNone(reject)
+            records.append(pipeline.annotate_task_and_quality(canonical, config))
+
+        pipeline.apply_dedupe_annotation(records[0], config, state)
+        pipeline.apply_dedupe_annotation(records[1], config, state)
+
+        self.assertEqual(state["seen"]["sft"], set())
+        self.assertEqual(state["normalized"]["sft"], set())
+        self.assertNotIn("normalized_duplicate_content", records[1]["quality"]["reject_reasons"])
+        self.assertIn("dedupe", records[1]["quality"])
+
+    def test_normalized_duplicate_with_number_variation_is_filtered(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            prompts = ["请修复第 42 行 Python 报错", "请修复第 43 行 Python 报错"]
+            for index, prompt in enumerate(prompts):
+                raw = sample_success_record()
+                raw["request_id"] = "request-%d" % index
+                raw["request_body"]["messages"] = [{"role": "user", "content": prompt}]
+                raw["response_body"]["choices"][0]["message"]["content"] = "可以检查异常栈并修复参数。"
+                write_json(day / "u" / "s" / ("%03d.json" % index), raw)
+            write_index(day, [
+                {"request_id": "request-0", "file_path": "2026-07-15/u/s/000.json"},
+                {"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"},
+            ])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15", router_min_score=1.0)
+
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            self.assertEqual(len(selected), 1)
+            self.assertTrue(any("normalized_duplicate_content" in row["reject_reasons"] for row in quality))
+
+    def test_quota_skipped_duplicate_candidate_does_not_pollute_cross_user_selection(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            rows = [
+                ("request-a-1", "user-a", "请写 Python 代码打印 quota seed", "print('quota seed')", "000.json"),
+                ("request-a-2", "user-a", "请写 Python 代码打印 shared", "print('shared')", "001.json"),
+                ("request-b-1", "user-b", "请写 Python 代码打印 shared", "print('shared')", "002.json"),
+            ]
+            index_rows = []
+            for request_id, user_id, prompt, response, name in rows:
+                raw = sample_success_record()
+                raw["request_id"] = request_id
+                raw["user_id"] = user_id
+                raw["session_id"] = "session-" + user_id
+                raw["request_body"]["messages"] = [{"role": "user", "content": prompt}]
+                raw["response_body"]["choices"][0]["message"]["content"] = response
+                path = day / user_id / "s" / name
+                write_json(path, raw)
+                index_rows.append({"request_id": request_id, "file_path": "2026-07-15/%s/s/%s" % (user_id, name)})
+            write_index(day, index_rows)
+
+            pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                max_selected_sft_per_user_per_day=1,
+                router_min_score=1.0,
+            )
+
+            selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(selected), 2)
+            self.assertEqual(
+                sorted(row["output"] for row in selected),
+                ["print('quota seed')", "print('shared')"],
+            )
+            self.assertFalse(any("duplicate_content" in row["reject_reasons"] for row in quality))
+            self.assertFalse(any("normalized_duplicate_content" in row["reject_reasons"] for row in quality))
+            self.assertFalse(any("duplicate" in row["quality"]["risk_labels"] for row in quality))
+
 
 class SelectionHardeningTest(unittest.TestCase):
     def test_quality_model_high_score_cannot_rescue_hard_reject(self):
@@ -2083,8 +2235,8 @@ class SelectionHardeningTest(unittest.TestCase):
             second = sample_success_record()
             second["request_id"] = "request-2"
             for raw, response in [
-                (first, "print('hello 1')"),
-                (second, "print('hello 2')"),
+                (first, "print('hello one')"),
+                (second, "print('hello two')"),
             ]:
                 raw["request_body"]["messages"] = [{"role": "user", "content": "请写 Python 代码打印 hello"}]
                 raw["response_body"]["choices"][0]["message"]["content"] = response
@@ -2100,6 +2252,7 @@ class SelectionHardeningTest(unittest.TestCase):
                 str(output_root),
                 "2026-07-15",
                 max_high_value_per_task_fingerprint_per_day=1,
+                router_min_score=1.0,
             )
 
             selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
