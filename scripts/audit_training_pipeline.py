@@ -2782,7 +2782,7 @@ def consider_selected_record(canonical, config, state, dedupe_state=None):
 
 def build_single_turn_selected_outputs(annotated_records, config):
     state = init_selected_export_state()
-    dedupe_state = init_dedupe_state(config)
+    dedupe_state = init_dedupe_state(config) if config.get("enable_dedupe", True) else None
     for canonical in sorted(annotated_records, key=selection_rank_key):
         consider_selected_record(canonical, config, state, dedupe_state)
     return state["outputs"]
@@ -2814,6 +2814,7 @@ def process_spooled_selection_records(spool_path, config, date, handles=None):
     report_state = init_selection_report_state()
     selected_state = init_selected_export_state()
     dedupe_state = init_dedupe_state(config)
+    selected_dedupe_state = dedupe_state if config.get("enable_dedupe", True) else None
     current_episode = []
 
     def flush_episode():
@@ -2826,7 +2827,7 @@ def process_spooled_selection_records(spool_path, config, date, handles=None):
     for canonical in iter_jsonl_records(spool_path):
         refresh_selection_use_for(canonical, config)
         apply_dedupe_annotation(canonical, config, dedupe_state)
-        consider_selected_record(canonical, config, selected_state, dedupe_state)
+        consider_selected_record(canonical, config, selected_state, selected_dedupe_state)
         update_selection_report_state(report_state, canonical)
         if handles is not None and not config.get("disable_diagnostics"):
             write_stream_record(handles, "quality/%s.jsonl" % date, quality_export_record(canonical))

@@ -40,6 +40,24 @@ class PipelineImportTest(unittest.TestCase):
             "--enable-label-snippets",
             "--disable-selection",
             "--compat-output-set",
+            "--disable-dedupe",
+            "--disable-near-duplicate-dedupe",
+            "--disable-debug-noise-filter",
+            "dedupe",
+            "debug noise",
+            "quality_stats",
+            "dedupe_rejected",
+            "risk_labels",
+            "dedupe_enabled",
+            "dedupe_config",
+            "final exact seen guard",
+            "exact duplicate",
+            "normalized duplicate",
+            "near duplicate",
+            "debug burst",
+            "raw prompts/responses",
+            "tenant/user/session hashes",
+            "internal dedupe hash fields",
             "AUDIT_SELECTION_HMAC_KEY",
         ]:
             self.assertIn(token, readme)
@@ -1872,6 +1890,59 @@ class SelectionDedupeTest(unittest.TestCase):
             self.assertEqual(len(selected), 1)
             self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
             self.assertTrue(any("duplicate" in row["quality"]["risk_labels"] for row in quality))
+
+    def test_disable_dedupe_keeps_new_dedupe_rejects_off_but_selected_seen_guard_remains(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-0",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+                {
+                    "request_id": "request-1",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+            ])
+
+            result = pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                disable_dedupe=True,
+                k_threshold=1,
+            )
+
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            selection_manifest = json.loads(
+                (output_root / "reports" / "2026-07-15.selection_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            dedupe_reject_reasons = {
+                "duplicate_content",
+                "normalized_duplicate_content",
+                "near_duplicate_content",
+                "debug_noise_repeat",
+                "debug_burst",
+            }
+            quality_reject_reasons = {
+                reason
+                for row in quality
+                for reason in row["reject_reasons"]
+            }
+
+            self.assertEqual(len(selected_sft), 1)
+            self.assertFalse(quality_reject_reasons & dedupe_reject_reasons)
+            self.assertFalse(result["selection"]["dedupe_enabled"])
+            self.assertFalse(selection_manifest["selection"]["dedupe_enabled"])
 
     def test_dedupe_rejected_counts_records_not_reasons(self):
         pipeline = load_pipeline_module()

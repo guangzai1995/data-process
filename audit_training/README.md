@@ -74,9 +74,20 @@ Useful output switches:
 --disable-episodes       Keep single-turn selected outputs but skip episodes and selected multi-turn SFT.
 --disable-diagnostics    Skip canonical, quality, and episodes files while still computing selected outputs.
 --compat-output-set      Alias for legacy-only compatibility output. Conflicts with model labeler flags.
+--disable-dedupe         Disable quality-layer dedupe and debug noise rejects; selected exports keep a final exact seen guard.
+--disable-near-duplicate-dedupe
+                         Disable near-duplicate rejects while keeping exact/normalized duplicate and debug noise filters.
+--disable-debug-noise-filter
+                         Disable repeated control-turn and debug burst rejects.
 ```
 
-Selection controls include score thresholds, per-user/task quotas, `--selection-mode auto|in-memory|spool`, `--max-in-memory-samples`, and `--max-selection-memory-mb`. Auto mode switches to a run-specific spool under `.tmp/` before retaining more records than configured. Dry runs exercise the same decision path and clean temp/spool files afterward.
+Selection controls include score thresholds, per-user/task quotas, `--selection-mode auto|in-memory|spool`, `--max-in-memory-samples`, and `--max-selection-memory-mb`. By default, selected training outputs filter exact duplicate, normalized duplicate, near duplicate, repeated debug/control turns, and debug burst records before export. `--disable-dedupe` disables quality-layer dedupe/debug noise reject reasons, but selected exports still keep a final exact seen guard so duplicate selected records are not written.
+
+Dedupe and debug noise thresholds include `--near-duplicate-simhash-hamming`, `--near-duplicate-jaccard`, `--max-debug-control-repeats-per-session`, and `--max-debug-task-burst-per-session`. Auto mode switches to a run-specific spool under `.tmp/` before retaining more records than configured. Dry runs exercise the same decision path and clean temp/spool files afterward.
+
+`reports/<date>.quality_stats.json` (`quality_stats`) includes aggregate `risk_labels` and `dedupe` counts. The selection manifest includes `dedupe_enabled`, `dedupe_rejected`, and `dedupe_config`.
+
+Quality/report dedupe metadata is limited to hashes, coarse buckets, counts, and decisions. It does not include raw prompts/responses, request IDs, tenant/user/session hashes, file paths, `request_id`, `tenant_hash`, `user_hash`, `session_hash`, `file_path_hash`, `content_hash`, or `task_fingerprint_internal`. Selected outputs do not include internal dedupe hash fields.
 
 ## Optional Labelers
 
