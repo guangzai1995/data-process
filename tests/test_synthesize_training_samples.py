@@ -118,6 +118,63 @@ class SyntheticParsingTest(unittest.TestCase):
 
         self.assertEqual(synth.sample_id_for(sample), first)
 
+    def test_parse_model_samples_accepts_top_level_sample_array(self):
+        synth = load_synth_module()
+        content = json.dumps(
+            [
+                {
+                    "task_type": "router",
+                    "topic": "routing",
+                    "input": "请判断这个请求应该走哪个模型",
+                    "label": "reasoning",
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        records = synth.parse_model_samples(
+            content,
+            generator_model="deepseek-v4-flash",
+            batch_index=1,
+            created_at="2026-07-20T00:00:00Z",
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["task_type"], "router")
+
+    def test_parse_model_samples_skips_invalid_schema_when_safe_records_remain(self):
+        synth = load_synth_module()
+        content = json.dumps(
+            {
+                "samples": [
+                    {
+                        "task_type": "tool_use_sft",
+                        "topic": "bad_tool",
+                        "messages": [{"role": "user", "content": "查一下天气"}],
+                        "tools": [{"function": {"name": "weather"}}],
+                        "response_message": {"role": "assistant", "content": None, "tool_calls": []},
+                    },
+                    {
+                        "task_type": "router",
+                        "topic": "routing",
+                        "input": "请分析这个问题的解题步骤",
+                        "label": "reasoning",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        records = synth.parse_model_samples(
+            content,
+            generator_model="deepseek-v4-flash",
+            batch_index=3,
+            created_at="2026-07-20T00:00:00Z",
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["task_type"], "router")
+
     def test_parse_model_samples_rejects_raw_audit_like_fields(self):
         synth = load_synth_module()
         content = json.dumps(
@@ -202,6 +259,68 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual(state["completed"], 2)
         self.assertEqual(calls, [(1, 2)])
+
+    def test_generate_batch_uses_json_mode_and_retries_invalid_content(self):
+        synth = load_synth_module()
+        calls = []
+        valid_content = json.dumps(
+            {
+                "samples": [
+                    {
+                        "task_type": "router",
+                        "topic": "routing",
+                        "input": "请判断这个请求应该走哪个模型",
+                        "label": "reasoning",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        class FakeResponse(object):
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [
+                            {"message": {"content": self.content}, "finish_reason": "stop"}
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            if len(calls) == 1:
+                return FakeResponse("not json")
+            return FakeResponse(valid_content)
+
+        records = synth.generate_batch(
+            {
+                "api_key": "key",
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-v4-flash",
+                "timeout": 30,
+                "max_retries": 2,
+            },
+            batch_index=2,
+            batch_size=1,
+            urlopen=fake_urlopen,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["response_format"], {"type": "json_object"})
+        self.assertEqual(calls[0]["thinking"], {"type": "disabled"})
+
 
 
 if __name__ == "__main__":

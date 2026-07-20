@@ -107,7 +107,7 @@ Real audit data lives outside this repo under `/isos_data_share/audit`. Do not c
 
 Safe synthetic generation uses `scripts/synthesize_training_samples.py` and does not read `/isos_data_share/audit` or send real audit-derived content to DeepSeek.
 
-Create a local `.env` from `.env.example` and run:
+Create a local `.env` from `.env.example` and run. `DEEPSEEK_MAX_RETRIES` defaults to 10 so transient network or malformed-model-output batches can retry before the resumable runner stops:
 
 ```bash
 scripts/run_synthetic_samples.sh --target-count 20 --batch-size 5

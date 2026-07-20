@@ -17,6 +17,7 @@ DEFAULT_OUTPUT_ROOT = "audit_training/synthetic_samples"
 DEFAULT_TARGET_COUNT = 20
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_RETRIES = 10
 
 SUPPORTED_TASK_TYPES = set(["sft", "router", "tool_use_sft"])
 ROUTE_LABELS = set([
@@ -99,6 +100,7 @@ def load_config(args):
         "base_url": env.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
         "model": env.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
         "timeout": positive_int(env.get("DEEPSEEK_TIMEOUT", DEFAULT_TIMEOUT), "DEEPSEEK_TIMEOUT"),
+        "max_retries": positive_int(env.get("DEEPSEEK_MAX_RETRIES", DEFAULT_MAX_RETRIES), "DEEPSEEK_MAX_RETRIES"),
     }
 
 
@@ -275,12 +277,24 @@ def parse_model_samples(content, generator_model, batch_index, created_at):
         payload = json.loads(strip_json_fence(content))
     except ValueError:
         raise ValueError("model response is not JSON")
-    samples = payload.get("samples") if isinstance(payload, dict) else None
+    if isinstance(payload, dict):
+        samples = payload.get("samples")
+    elif isinstance(payload, list):
+        samples = payload
+    else:
+        samples = None
     if not isinstance(samples, list) or not samples:
         raise ValueError("model response must contain samples")
     records = []
+    skipped = 0
     for raw_sample in samples:
-        normalized = normalize_sample(raw_sample)
+        if contains_audit_like_key(raw_sample):
+            raise ValueError("synthetic sample contains audit-like field")
+        try:
+            normalized = normalize_sample(raw_sample)
+        except ValueError:
+            skipped += 1
+            continue
         normalized["source"] = {
             "type": "synthetic",
             "generator_model": generator_model,
@@ -289,35 +303,84 @@ def parse_model_samples(content, generator_model, batch_index, created_at):
         }
         normalized["sample_id"] = sample_id_for(normalized)
         records.append(normalized)
+    if not records:
+        if skipped:
+            raise ValueError("model response contains no valid samples")
+        raise ValueError("model response must contain samples")
     return records
 
 
 def synthetic_prompt(batch_index, batch_size):
-    return (
-        "Generate %d purely synthetic Chinese training samples. Do not use or mention "
-        "real users, tenants, request IDs, file paths, logs, API keys, phone numbers, "
-        "emails, or private data. Return only JSON with a top-level samples array. "
-        "Each sample must use one task_type from sft, router, tool_use_sft. "
-        "For sft include topic, messages, response. For router include topic, input, "
-        "label using one of: %s. For tool_use_sft include topic, messages, tools, "
-        "response_message with valid tool_calls. Batch index: %d."
-    ) % (batch_size, ", ".join(sorted(ROUTE_LABELS)), batch_index)
-
-
-def generate_batch(config, batch_index, batch_size, urlopen=None):
-    body = json.dumps(
-        {
-            "model": config["model"],
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Return only valid compact JSON for synthetic training data.",
+    example = {
+        "samples": [
+            {
+                "task_type": "router",
+                "topic": "routing",
+                "input": "请判断这个请求应该走哪个模型：请写一个 Python 排序函数",
+                "label": "code_generation",
+            },
+            {
+                "task_type": "sft",
+                "topic": "code_explanation",
+                "messages": [{"role": "user", "content": "解释 Python 的 list comprehension"}],
+                "response": "列表推导式用于从可迭代对象快速构造列表。",
+            },
+            {
+                "task_type": "tool_use_sft",
+                "topic": "tool_weather",
+                "messages": [{"role": "user", "content": "查询杭州明天的天气"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ],
+                "response_message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"杭州\",\"date\":\"明天\"}",
+                            },
+                        }
+                    ],
                 },
-                {"role": "user", "content": synthetic_prompt(batch_index, batch_size)},
-            ],
-            "temperature": 0.7,
-            "max_tokens": 3000,
-        },
+            },
+        ]
+    }
+    return (
+        "Generate %d purely synthetic Chinese training samples as json. Do not use or mention "
+        "real users, tenants, request IDs, file paths, logs, API keys, phone numbers, "
+        "emails, or private data. Return exactly one JSON object with a top-level samples array. "
+        "No markdown, no comments, no explanation. Each sample must use one task_type from "
+        "sft, router, tool_use_sft. For sft include topic, messages, response. For router "
+        "include topic, input, label using one of: %s. For tool_use_sft include topic, "
+        "messages, tools, response_message with valid non-empty tool_calls. Follow this shape: %s. "
+        "Batch index: %d."
+    ) % (batch_size, ", ".join(sorted(ROUTE_LABELS)), json.dumps(example, ensure_ascii=False, sort_keys=True), batch_index)
+
+
+def chat_completion_body(config, batch_index, batch_size):
+    return {
+        "model": config["model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only valid compact json for synthetic training data.",
+            },
+            {"role": "user", "content": synthetic_prompt(batch_index, batch_size)},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 5000,
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+    }
+
+
+def generate_batch_once(config, batch_index, batch_size, urlopen=None):
+    body = json.dumps(
+        chat_completion_body(config, batch_index, batch_size),
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
@@ -333,7 +396,7 @@ def generate_batch(config, batch_index, batch_size, urlopen=None):
     with opener(request, timeout=config["timeout"]) as response:
         payload = json.loads(response.read().decode("utf-8"))
     content = text_from_response_payload(payload)
-    if content is None:
+    if content is None or not content.strip():
         raise ValueError("missing model response content")
     return parse_model_samples(
         content,
@@ -341,6 +404,17 @@ def generate_batch(config, batch_index, batch_size, urlopen=None):
         batch_index=batch_index,
         created_at=utc_now(),
     )
+
+
+def generate_batch(config, batch_index, batch_size, urlopen=None):
+    max_retries = int(config.get("max_retries") or DEFAULT_MAX_RETRIES)
+    last_error = None
+    for _attempt in range(max_retries):
+        try:
+            return generate_batch_once(config, batch_index, batch_size, urlopen=urlopen)
+        except Exception as exc:
+            last_error = exc
+    raise last_error
 
 
 def read_existing_ids(output_file):
