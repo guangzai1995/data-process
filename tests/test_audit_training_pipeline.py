@@ -1684,6 +1684,35 @@ class SelectionPipelineTest(unittest.TestCase):
 
 
 class SelectionDedupeTest(unittest.TestCase):
+    def make_annotated_record(
+        self,
+        pipeline,
+        prompt,
+        request_id="request-1",
+        response="可以用 Python 逐行读取并统计结果。",
+        timestamp_ms=None,
+        user_id="user-1",
+        tenant_id="tenant-1",
+        session_id="session-1",
+        config=None,
+    ):
+        raw = sample_success_record()
+        raw["request_id"] = request_id
+        raw["user_id"] = user_id
+        raw["tenant_id"] = tenant_id
+        raw["session_id"] = session_id
+        if timestamp_ms is not None:
+            raw["timestamp_ms"] = timestamp_ms
+        raw["request_body"]["messages"] = [{"role": "user", "content": prompt}]
+        raw["response_body"]["choices"][0]["message"]["content"] = response
+        canonical, reject = pipeline.build_canonical_sample(
+            "2026-07-15",
+            {"request_id": request_id, "file_path": "2026-07-15/u/s/%s.json" % request_id},
+            raw,
+        )
+        self.assertIsNone(reject)
+        return pipeline.annotate_task_and_quality(canonical, config or pipeline.default_selection_config())
+
     def test_normalize_for_dedupe_replaces_numbers_paths_urls_and_placeholders(self):
         pipeline = load_pipeline_module()
         text = "  请修复 /tmp/app-123.py 第 42 行，见 https://example.com/a?id=9 <SECRET_1>  "
@@ -1864,6 +1893,259 @@ class SelectionDedupeTest(unittest.TestCase):
             selected = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
             self.assertEqual(len(selected), 1)
             self.assertTrue(any("normalized_duplicate_content" in row["reject_reasons"] for row in quality))
+
+    def test_near_duplicate_prompt_in_same_bucket_is_filtered(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(router_min_score=1.0)
+        prompts = [
+            "请帮我写一个 Python 脚本读取 jsonl 文件并统计每个用户的调用次数",
+            "帮我写 Python 脚本读取 jsonl 并统计每个用户调用次数",
+        ]
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                prompt,
+                request_id="request-%d" % index,
+                timestamp_ms=1000 + index,
+                config=config,
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+        selected = pipeline.build_selected_outputs(records, [], config)
+
+        self.assertEqual(len(selected["sft"]), 1)
+        self.assertNotIn("near_duplicate_content", records[0]["quality"]["reject_reasons"])
+        self.assertIn("near_duplicate_content", records[1]["quality"]["reject_reasons"])
+        self.assertIn("near_duplicate", records[1]["quality"]["risk_labels"])
+        self.assertEqual(records[1]["quality"]["use_for"], [])
+
+    def test_near_duplicate_with_hmac_selection_key_uses_coarse_bucket(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            router_min_score=1.0,
+            selection_hmac_key="secret-key",
+        )
+        prompts = [
+            "请帮我写一个 Python 脚本读取 jsonl 文件并统计每个用户的调用次数",
+            "帮我写 Python 脚本读取 jsonl 并统计每个用户调用次数",
+        ]
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                prompt,
+                request_id="request-hmac-%d" % index,
+                timestamp_ms=1000 + index,
+                config=config,
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertIn("near_duplicate_content", records[1]["quality"]["reject_reasons"])
+        self.assertIn("near_duplicate", records[1]["quality"]["risk_labels"])
+
+    def test_similar_prompt_in_different_route_bucket_is_not_near_duplicate(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(router_min_score=1.0)
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请帮我写一个 Python 脚本读取 jsonl 文件并统计每个用户的调用次数",
+                request_id="request-0",
+                timestamp_ms=1000,
+                config=config,
+            ),
+            self.make_annotated_record(
+                pipeline,
+                "帮我写 Python 脚本读取 jsonl 并统计每个用户调用次数",
+                request_id="request-1",
+                timestamp_ms=1001,
+                config=config,
+            ),
+        ]
+        records[1]["task"]["route_label"] = "domain_qa"
+        records[1]["task"]["intent_label"] = "domain_lookup"
+        records[1]["task"]["task_bucket"] = "domain_qa:domain_lookup"
+
+        state = pipeline.init_dedupe_state(config)
+        pipeline.apply_dedupe_annotation(records[0], config, state)
+        pipeline.apply_dedupe_annotation(records[1], config, state)
+
+        self.assertNotIn("near_duplicate_content", records[1]["quality"]["reject_reasons"])
+        self.assertNotIn("near_duplicate", records[1]["quality"]["risk_labels"])
+        self.assertIn("sft", records[1]["quality"]["use_for"])
+
+    def test_sequence_like_keyword_substitution_is_not_near_duplicate(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(router_min_score=1.0)
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请写 Python 脚本同步执行任务队列并返回处理结果",
+                request_id="request-sync",
+                response="可以使用同步循环逐个执行任务并收集结果。",
+                timestamp_ms=1000,
+                config=config,
+            ),
+            self.make_annotated_record(
+                pipeline,
+                "请写 Python 脚本异步执行任务队列并返回处理结果",
+                request_id="request-async",
+                response="可以使用 asyncio 并发调度任务并汇总结果。",
+                timestamp_ms=1001,
+                config=config,
+            ),
+        ]
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertNotIn("near_duplicate_content", records[1]["quality"]["reject_reasons"])
+        self.assertNotIn("near_duplicate", records[1]["quality"]["risk_labels"])
+        self.assertIn("sft", records[1]["quality"]["use_for"])
+
+    def test_repeated_control_turns_trigger_debug_noise_repeat(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            selected_min_score=0.0,
+            router_min_score=0.0,
+            sft_min_score=0.0,
+            max_debug_control_repeats_per_session=2,
+        )
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "继续",
+                request_id="request-%d" % index,
+                response="继续处理上一个问题。",
+                timestamp_ms=1000 + index,
+                config=config,
+            )
+            for index in range(3)
+        ]
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertNotIn("debug_noise_repeat", records[0]["quality"]["reject_reasons"])
+        self.assertNotIn("debug_noise_repeat", records[1]["quality"]["reject_reasons"])
+        self.assertIn("debug_noise_repeat", records[2]["quality"]["reject_reasons"])
+        self.assertIn("debug_noise", records[2]["quality"]["risk_labels"])
+        self.assertEqual(records[2]["quality"]["use_for"], [])
+
+    def test_debug_burst_is_order_independent_from_selection_rank(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            enable_near_duplicate_dedupe=False,
+            max_debug_task_burst_per_session=2,
+            debug_burst_window_minutes=20,
+            router_min_score=1.0,
+        )
+        minutes = [0, 10, 100, 15]
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请写 Python 脚本读取 jsonl 文件并统计每个用户调用次数",
+                request_id="request-%d" % minute,
+                response="可以用 json 模块逐行读取并累计用户调用次数。%d" % minute,
+                timestamp_ms=minute * 60 * 1000,
+                config=config,
+            )
+            for minute in minutes
+        ]
+        for record in records[:3]:
+            record["quality"]["final_quality_score"] = 0.95
+        records[3]["quality"]["final_quality_score"] = 0.50
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertIn("debug_burst", records[3]["quality"]["reject_reasons"])
+        self.assertIn("debug_burst", records[3]["quality"]["risk_labels"])
+
+    def test_debug_burst_uses_true_window_not_symmetric_span(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            enable_near_duplicate_dedupe=False,
+            max_debug_task_burst_per_session=2,
+            debug_burst_window_minutes=20,
+            router_min_score=1.0,
+        )
+        middle = self.make_annotated_record(
+            pipeline,
+            "请写 Python 脚本读取 jsonl 文件并统计每个用户调用次数",
+            request_id="request-middle",
+            response="可以用 json 模块逐行读取并累计用户调用次数。",
+            timestamp_ms=20 * 60 * 1000,
+            config=config,
+        )
+        state = pipeline.init_dedupe_state(config)
+        burst_key = "%s:%s" % (
+            pipeline.dedupe_session_key(middle),
+            middle["task"]["task_fingerprint_internal"],
+        )
+        state["session_task_times"][burst_key] = [0, 40 * 60 * 1000]
+
+        pipeline.apply_dedupe_annotation(middle, config, state)
+
+        self.assertNotIn("debug_burst", middle["quality"]["reject_reasons"])
+        self.assertNotIn("debug_burst", middle["quality"]["risk_labels"])
+
+    def test_debug_burst_task_time_state_is_bounded_per_key(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            enable_near_duplicate_dedupe=False,
+            max_debug_task_burst_per_session=2,
+            debug_burst_window_minutes=20,
+            router_min_score=1.0,
+        )
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请写 Python 脚本读取 jsonl 文件并统计每个用户调用次数",
+                request_id="request-burst-%03d" % index,
+                response="可以用 json 模块逐行读取并累计用户调用次数。%d" % index,
+                timestamp_ms=index * 1000,
+                config=config,
+            )
+            for index in range(100)
+        ]
+
+        state = pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertLessEqual(
+            max(len(times) for times in state["session_task_times"].values()),
+            config["max_debug_task_burst_per_session"] + 1,
+        )
+
+    def test_same_session_task_burst_triggers_debug_burst(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(
+            enable_near_duplicate_dedupe=False,
+            max_debug_task_burst_per_session=2,
+            debug_burst_window_minutes=20,
+            router_min_score=1.0,
+        )
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请写 Python 脚本读取 jsonl 文件并统计每个用户调用次数",
+                request_id="request-%d" % index,
+                response="可以用 json 模块逐行读取并累计用户调用次数。%d" % index,
+                timestamp_ms=1000 + index * 60000,
+                config=config,
+            )
+            for index in range(4)
+        ]
+
+        pipeline.apply_dedupe_annotations_to_records(records, config)
+
+        self.assertNotIn("debug_burst", records[0]["quality"]["reject_reasons"])
+        self.assertNotIn("debug_burst", records[1]["quality"]["reject_reasons"])
+        self.assertIn("debug_burst", records[2]["quality"]["reject_reasons"])
+        self.assertIn("debug_burst", records[2]["quality"]["risk_labels"])
+        self.assertEqual(records[2]["quality"]["use_for"], [])
+        self.assertIn("debug_burst", records[3]["quality"]["reject_reasons"])
 
     def test_quota_skipped_duplicate_candidate_does_not_pollute_cross_user_selection(self):
         pipeline = load_pipeline_module()

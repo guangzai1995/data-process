@@ -2182,6 +2182,7 @@ def init_dedupe_state(config):
         "dedupe_counts": {},
         "risk_counts": {},
         "max_seen_hashes": config.get("max_dedupe_seen_hashes", 1000000),
+        "max_user_session_windows": config.get("max_dedupe_user_session_windows", 100000),
     }
 
 
@@ -2238,6 +2239,132 @@ def dedupe_bucket(canonical):
     )
 
 
+def dedupe_session_key(canonical):
+    source = canonical.get("source", {})
+    return "%s:%s:%s" % (
+        source.get("tenant_hash") or "missing_tenant",
+        source.get("user_hash") or "missing_user",
+        source.get("session_hash") or "missing_session",
+    )
+
+
+def is_debug_control_text(text):
+    normalized = normalize_for_dedupe(text)
+    if not normalized:
+        return False
+    controls = set(normalize_for_dedupe(value) for value in DEBUG_CONTROL_TEXTS)
+    continuations = set(normalize_for_dedupe(value) for value in CONTINUATION_TERMS)
+    return normalized in controls or normalized in continuations
+
+
+def mark_dedupe_global_suppression(canonical, state, reason, risk):
+    quality = canonical.setdefault("quality", {})
+    dedupe = quality.setdefault("dedupe", {})
+    for kind in list(quality.get("use_for") or []):
+        add_unique_list_value(dedupe.setdefault("suppressed_use_for", []), kind)
+    add_unique_list_value(dedupe.setdefault("matched_reasons", []), reason)
+    dedupe["matched_reason"] = reason
+    dedupe["decision"] = "suppressed"
+    quality["use_for"] = []
+    add_unique_list_value(quality.setdefault("risk_labels", []), risk)
+    add_dedupe_count(state, reason)
+    add_dedupe_risk(state, risk)
+    finalize_dedupe_suppression(canonical)
+
+
+def compact_char_grams(text, width=2):
+    compact = (text or "").replace(" ", "")
+    if len(compact) < width:
+        return set()
+    return set(compact[index:index + width] for index in range(len(compact) - width + 1))
+
+
+def compressed_near_duplicate(left_text, right_text, threshold):
+    left_compact = (left_text or "").replace(" ", "")
+    right_compact = (right_text or "").replace(" ", "")
+    if not left_compact or not right_compact or left_compact == right_compact:
+        return False
+    shorter, longer = sorted([left_compact, right_compact], key=len)
+    if float(len(shorter)) / float(len(longer)) > 0.88:
+        return False
+    shorter_grams = compact_char_grams(shorter)
+    longer_grams = compact_char_grams(longer)
+    if not shorter_grams or not longer_grams:
+        return False
+    containment = float(len(shorter_grams & longer_grams)) / float(len(shorter_grams))
+    return containment >= threshold
+
+
+def near_duplicate_matches(normalized, tokens, simhash, representative, config):
+    representative_normalized = representative.get("normalized") or ""
+    if representative_normalized == normalized:
+        return False
+    distance = hamming_distance64(simhash, representative.get("simhash", 0))
+    if distance <= config.get("near_duplicate_simhash_hamming", 4):
+        return True
+    threshold = config.get("near_duplicate_jaccard", 0.88)
+    similarity = jaccard_similarity(tokens, representative.get("tokens") or [])
+    if similarity >= threshold:
+        return True
+    return compressed_near_duplicate(normalized, representative_normalized, threshold)
+
+
+def max_events_in_window(times, window_ms):
+    ordered = sorted(times)
+    max_count = 0
+    left = 0
+    for right, event_time_ms in enumerate(ordered):
+        while event_time_ms - ordered[left] > window_ms:
+            left += 1
+        max_count = max(max_count, right - left + 1)
+    return max_count
+
+
+def apply_debug_noise_filters(canonical, config, state, text, normalized):
+    if not config.get("enable_debug_noise_filter", True):
+        return canonical
+    session_key = dedupe_session_key(canonical)
+    max_windows = state.get("max_user_session_windows", config.get("max_dedupe_user_session_windows", 100000))
+    if is_debug_control_text(text):
+        control_key = "%s:%s" % (session_key, normalized)
+        control_counts = state.setdefault("session_control_counts", {})
+        if can_add_state_key(control_counts, control_key, max_windows, canonical, state):
+            count = control_counts.get(control_key, 0) + 1
+            control_counts[control_key] = count
+            if count > config.get("max_debug_control_repeats_per_session", 2):
+                mark_dedupe_global_suppression(canonical, state, "debug_noise_repeat", "debug_noise")
+    event_time_ms = canonical.get("source", {}).get("event_time_ms")
+    if event_time_ms is None:
+        return canonical
+    task_key = canonical.get("task", {}).get("task_fingerprint_internal") or "unknown_task"
+    burst_key = "%s:%s" % (session_key, task_key)
+    task_times = state.setdefault("session_task_times", {})
+    if not can_add_state_key(task_times, burst_key, max_windows, canonical, state):
+        return canonical
+    try:
+        window_minutes = float(config.get("debug_burst_window_minutes", 20))
+    except (TypeError, ValueError):
+        window_minutes = 20.0
+    window_ms = max(0, int(window_minutes * 60 * 1000))
+    lower_bound = event_time_ms - window_ms
+    upper_bound = event_time_ms + window_ms
+    times = [
+        time_ms for time_ms in task_times.get(burst_key, [])
+        if lower_bound <= time_ms <= upper_bound
+    ]
+    times.append(event_time_ms)
+    times.sort()
+    try:
+        max_task_burst = int(config.get("max_debug_task_burst_per_session", 8))
+    except (TypeError, ValueError):
+        max_task_burst = 8
+    if max_events_in_window(times, window_ms) > max_task_burst:
+        mark_dedupe_global_suppression(canonical, state, "debug_burst", "debug_burst")
+    state_limit = max(1, max_task_burst + 1)
+    task_times[burst_key] = times[-state_limit:]
+    return canonical
+
+
 def mark_dedupe_suppression(canonical, state, reason, risk, kind):
     quality = canonical.setdefault("quality", {})
     dedupe = quality.setdefault("dedupe", {})
@@ -2261,25 +2388,42 @@ def finalize_dedupe_suppression(canonical):
         dedupe["decision"] = "rejected"
 
 
-def apply_dedupe_annotation(canonical, config, state):
+def ensure_dedupe_metadata(canonical, normalized, tokens, simhash):
+    quality = canonical.setdefault("quality", {})
+    dedupe = quality.setdefault("dedupe", {})
+    dedupe.update({
+        "bucket": dedupe_bucket(canonical),
+        "normalized_prompt_hash": content_hash(normalized)[:24],
+        "simhash64": "%016x" % simhash,
+        "token_count": len(tokens),
+    })
+    dedupe.setdefault("decision", "checked")
+    return dedupe
+
+
+def apply_dedupe_annotation(
+    canonical,
+    config,
+    state,
+    apply_debug_filters=True,
+    apply_near_duplicates=True,
+    count_checked=True,
+):
     quality = canonical.setdefault("quality", {})
     text = last_user_content(canonical.get("request", {}).get("messages") or [])
     normalized = normalize_for_dedupe(text)
     tokens = dedupe_tokens(text)
     simhash = simhash64(tokens)
-    near_bucket = canonical.get("task", {}).get("task_bucket") or task_bucket_for(
-        canonical, config.get("selection_hmac_key")
-    )
-    quality["dedupe"] = {
-        "bucket": dedupe_bucket(canonical),
-        "normalized_prompt_hash": content_hash(normalized)[:24],
-        "simhash64": "%016x" % simhash,
-        "token_count": len(tokens),
-        "decision": "checked",
-    }
-    if not config.get("enable_dedupe", True) or quality.get("reject_reasons"):
+    dedupe = ensure_dedupe_metadata(canonical, normalized, tokens, simhash)
+    near_bucket = dedupe["bucket"]
+    if not config.get("enable_dedupe", True):
         return canonical
-    add_dedupe_count(state, "checked")
+    if count_checked:
+        add_dedupe_count(state, "checked")
+    if apply_debug_filters:
+        apply_debug_noise_filters(canonical, config, state, text, normalized)
+    if quality.get("reject_reasons") or not apply_near_duplicates:
+        return canonical
     if not config.get("enable_near_duplicate_dedupe", True):
         return canonical
     if len(normalized) < config.get("near_duplicate_min_chars", 16):
@@ -2291,6 +2435,12 @@ def apply_dedupe_annotation(canonical, config, state):
     if not can_add_state_key(representatives, near_bucket, max_buckets, canonical, state):
         return canonical
     bucket_representatives = representatives.setdefault(near_bucket, [])
+    for representative in bucket_representatives:
+        if representative.get("normalized") == normalized:
+            return canonical
+        if near_duplicate_matches(normalized, tokens, simhash, representative, config):
+            mark_dedupe_global_suppression(canonical, state, "near_duplicate_content", "near_duplicate")
+            return canonical
     max_representatives = config.get("max_near_duplicate_representatives_per_bucket", 128)
     if len(bucket_representatives) >= max_representatives:
         mark_dedupe_saturated(canonical, state)
@@ -2303,11 +2453,37 @@ def apply_dedupe_annotation(canonical, config, state):
     return canonical
 
 
+def dedupe_event_order_key(canonical):
+    source = canonical.get("source", {})
+    return (
+        source.get("event_time_ms") is None,
+        source.get("event_time_ms") or 0,
+        source.get("index_order") or [],
+        canonical.get("sample_id") or "",
+    )
+
+
 def apply_dedupe_annotations_to_records(annotated_records, config):
     state = init_dedupe_state(config)
+    for canonical in sorted(annotated_records, key=dedupe_event_order_key):
+        refresh_selection_use_for(canonical, config)
+        apply_dedupe_annotation(
+            canonical,
+            config,
+            state,
+            apply_debug_filters=True,
+            apply_near_duplicates=False,
+        )
     for canonical in sorted(annotated_records, key=selection_rank_key):
         refresh_selection_use_for(canonical, config)
-        apply_dedupe_annotation(canonical, config, state)
+        apply_dedupe_annotation(
+            canonical,
+            config,
+            state,
+            apply_debug_filters=False,
+            apply_near_duplicates=True,
+            count_checked=False,
+        )
     return state
 
 
