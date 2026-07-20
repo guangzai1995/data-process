@@ -1486,6 +1486,20 @@ class SelectionPipelineTest(unittest.TestCase):
             "--enable-route-labeler",
             "--enable-quality-labeler",
             "--enable-label-snippets",
+            "--disable-dedupe",
+            "--disable-near-duplicate-dedupe",
+            "--disable-debug-noise-filter",
+            "--near-duplicate-simhash-hamming", "5",
+            "--near-duplicate-jaccard", "0.9",
+            "--near-duplicate-min-chars", "32",
+            "--near-duplicate-min-tokens", "6",
+            "--max-near-duplicate-representatives-per-bucket", "64",
+            "--max-debug-control-repeats-per-session", "3",
+            "--max-debug-task-burst-per-session", "9",
+            "--debug-burst-window-minutes", "15",
+            "--max-dedupe-seen-hashes", "100",
+            "--max-dedupe-user-session-windows", "20",
+            "--max-near-duplicate-buckets", "30",
         ])
         self.assertTrue(args.disable_episodes)
         self.assertEqual(args.selection_mode, "spool")
@@ -1493,9 +1507,29 @@ class SelectionPipelineTest(unittest.TestCase):
         self.assertTrue(args.enable_route_labeler)
         self.assertTrue(args.enable_quality_labeler)
         self.assertTrue(args.enable_label_snippets)
+        self.assertTrue(args.disable_dedupe)
+        self.assertTrue(args.disable_near_duplicate_dedupe)
+        self.assertTrue(args.disable_debug_noise_filter)
+        self.assertEqual(args.near_duplicate_simhash_hamming, 5)
+        self.assertEqual(args.near_duplicate_jaccard, 0.9)
+        self.assertEqual(args.near_duplicate_min_chars, 32)
+        self.assertEqual(args.near_duplicate_min_tokens, 6)
+        self.assertEqual(args.max_near_duplicate_representatives_per_bucket, 64)
+        self.assertEqual(args.max_debug_control_repeats_per_session, 3)
+        self.assertEqual(args.max_debug_task_burst_per_session, 9)
+        self.assertEqual(args.debug_burst_window_minutes, 15)
+        self.assertEqual(args.max_dedupe_seen_hashes, 100)
+        self.assertEqual(args.max_dedupe_user_session_windows, 20)
+        self.assertEqual(args.max_near_duplicate_buckets, 30)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 pipeline.parse_args(["--date", "2026-07-15", "--compat-output-set", "--enable-quality-labeler"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                pipeline.parse_args(["--date", "2026-07-15", "--near-duplicate-jaccard", "1.1"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                pipeline.parse_args(["--date", "2026-07-15", "--near-duplicate-simhash-hamming", "65"])
 
     def test_route_label_payload_is_feature_only_by_default(self):
         pipeline = load_pipeline_module()
@@ -1684,6 +1718,31 @@ class SelectionPipelineTest(unittest.TestCase):
 
 
 class SelectionDedupeTest(unittest.TestCase):
+    def write_process_records(self, day, rows):
+        index_rows = []
+        for index, row in enumerate(rows):
+            raw = sample_success_record()
+            request_id = row.get("request_id", "request-%d" % index)
+            raw["request_id"] = request_id
+            raw["user_id"] = row.get("user_id", raw["user_id"])
+            raw["tenant_id"] = row.get("tenant_id", raw["tenant_id"])
+            raw["session_id"] = row.get("session_id", raw["session_id"])
+            raw["timestamp"] = row.get("timestamp", raw["timestamp"])
+            if "timestamp_ms" in row:
+                raw["timestamp_ms"] = row["timestamp_ms"]
+            raw["request_body"]["messages"] = [{"role": "user", "content": row["prompt"]}]
+            raw["response_body"]["choices"][0]["message"]["content"] = row.get(
+                "response",
+                "可以使用 print('hello')",
+            )
+            name = "%03d.json" % index
+            write_json(day / "u" / "s" / name, raw)
+            index_rows.append({
+                "request_id": request_id,
+                "file_path": "2026-07-15/u/s/%s" % name,
+            })
+        write_index(day, index_rows)
+
     def make_annotated_record(
         self,
         pipeline,
@@ -1813,6 +1872,281 @@ class SelectionDedupeTest(unittest.TestCase):
             self.assertEqual(len(selected), 1)
             self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
             self.assertTrue(any("duplicate" in row["quality"]["risk_labels"] for row in quality))
+
+    def test_dedupe_rejected_counts_records_not_reasons(self):
+        pipeline = load_pipeline_module()
+        state = pipeline.init_selection_report_state()
+        canonical = {
+            "task": {
+                "route_label": "code_generation",
+                "intent_label": "write_code",
+            },
+            "quality": {
+                "score_bucket": "high",
+                "reject_reasons": ["near_duplicate_content", "debug_burst"],
+                "risk_labels": ["near_duplicate", "debug_burst"],
+            },
+        }
+
+        pipeline.update_selection_report_state(state, canonical)
+
+        stats = pipeline.quality_stats_from_state(state, 1)
+        self.assertEqual(stats["dedupe"]["near_duplicate_content"], 1)
+        self.assertEqual(stats["dedupe"]["debug_burst"], 1)
+        self.assertEqual(pipeline.dedupe_rejected_from_report_state(state), 1)
+
+    def test_quality_stats_include_risk_labels_and_dedupe_summary(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-0",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+                {
+                    "request_id": "request-1",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+            ])
+
+            pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                k_threshold=1,
+            )
+
+            stats = json.loads(
+                (output_root / "reports" / "2026-07-15.quality_stats.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("risk_labels", stats)
+            self.assertIn("dedupe", stats)
+            self.assertEqual(stats["dedupe"]["duplicate_content"], 1)
+            self.assertGreaterEqual(stats["risk_labels"]["duplicate"], 1)
+
+    def test_in_memory_episode_diagnostics_reflect_selected_duplicate_rejects(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-0",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                    "timestamp_ms": 0,
+                },
+                {
+                    "request_id": "request-1",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                    "timestamp_ms": 5 * 60 * 1000,
+                },
+            ])
+
+            pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                k_threshold=1,
+            )
+
+            episodes = read_jsonl(output_root / "episodes" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
+            self.assertFalse(any(episode["eligible_for_selected_multi_turn"] for episode in episodes))
+
+    def test_quality_dedupe_metadata_exports_only_safe_whitelisted_fields(self):
+        pipeline = load_pipeline_module()
+        canonical = {
+            "sample_id": "sample-1",
+            "source": {"date": "2026-07-15"},
+            "request": {"model": "glm-5.2", "tools": []},
+            "response": {"message": {"content": "", "tool_calls": []}},
+            "task": {"route_label": "code_generation", "intent_label": "write_code"},
+            "quality": {
+                "dedupe": {
+                    "bucket": "code_generation:write_code",
+                    "normalized_prompt_hash": "abc123",
+                    "simhash64": "0000000000000001",
+                    "token_count": 7,
+                    "decision": "rejected",
+                    "matched_reason": "near_duplicate_content",
+                    "matched_reasons": ["near_duplicate_content", 42, {"bad": "shape"}],
+                    "suppressed_use_for": ["sft", ["nested"]],
+                    "normalized_prompt": "RAW_PROMPT",
+                    "request_id": "request-secret",
+                    "raw_text": "secret",
+                    "future_nested": {"raw": "secret"},
+                },
+            },
+        }
+
+        record = pipeline.quality_export_record(canonical)
+
+        dedupe = record["quality"]["dedupe"]
+        self.assertEqual(
+            set(dedupe.keys()),
+            set([
+                "bucket",
+                "normalized_prompt_hash",
+                "simhash64",
+                "token_count",
+                "decision",
+                "matched_reason",
+                "matched_reasons",
+                "suppressed_use_for",
+            ]),
+        )
+        self.assertEqual(dedupe["matched_reasons"], ["near_duplicate_content"])
+        self.assertEqual(dedupe["suppressed_use_for"], ["sft"])
+        dumped = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn("RAW_PROMPT", dumped)
+        self.assertNotIn("request-secret", dumped)
+        self.assertNotIn("secret", dumped)
+        self.assertNotIn("future_nested", dumped)
+
+    def test_quality_output_includes_safe_dedupe_metadata_without_raw_text(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            prompt = "请写 Python 代码打印 SAFE_DEDUPE_PROMPT_FRAGMENT"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-safe-dedupe",
+                    "prompt": prompt,
+                    "response": "print('safe dedupe')",
+                },
+            ])
+
+            pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(quality), 1)
+            dedupe = quality[0]["quality"].get("dedupe")
+            self.assertIsInstance(dedupe, dict)
+            for key in ["normalized_prompt_hash", "simhash64", "bucket", "token_count", "decision"]:
+                self.assertIn(key, dedupe)
+            dumped = json.dumps(quality[0], ensure_ascii=False, sort_keys=True)
+            self.assertNotIn("SAFE_DEDUPE_PROMPT_FRAGMENT", dumped)
+            self.assertNotIn("request-safe-dedupe", dumped)
+
+    def test_spool_mode_applies_dedupe_before_quality_and_selected_outputs(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-0",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+                {
+                    "request_id": "request-1",
+                    "prompt": "请写 Python 代码打印 hello",
+                    "response": "print('hello')",
+                },
+            ])
+
+            result = pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                selection_mode="spool",
+                k_threshold=1,
+            )
+
+            self.assertEqual(result["selection"]["mode_used"], "spool")
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(len(selected_sft), 1)
+            self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
+
+    def test_spool_near_duplicate_ignores_non_selected_representatives(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(k_threshold=1, selected_min_score=0.85)
+        records = [
+            self.make_annotated_record(
+                pipeline,
+                "请帮我写一个 Python 脚本读取 jsonl 文件并统计每个用户的调用次数",
+                request_id="request-low",
+                response="可以用 json 模块逐行读取并累计用户调用次数。",
+                timestamp_ms=1000,
+                config=config,
+            ),
+            self.make_annotated_record(
+                pipeline,
+                "帮我写 Python 脚本读取 jsonl 并统计每个用户调用次数",
+                request_id="request-high",
+                response="可以用 json 模块逐行读取并累计用户调用次数。",
+                timestamp_ms=2000,
+                config=config,
+            ),
+        ]
+        records[0]["quality"]["deterministic_quality_score"] = 0.8
+        records[0]["quality"]["final_quality_score"] = 0.8
+        records[0]["quality"]["score_bucket"] = "high"
+        records[0]["quality"]["use_for"] = []
+        records[1]["quality"]["deterministic_quality_score"] = 0.88
+        records[1]["quality"]["final_quality_score"] = 0.88
+        records[1]["quality"]["score_bucket"] = "high"
+        with tempfile.TemporaryDirectory() as tmp:
+            spool_path = pathlib.Path(tmp) / "candidates.jsonl"
+            with spool_path.open("w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
+
+            result = pipeline.process_spooled_selection_records(spool_path, config, "2026-07-15")
+
+        self.assertEqual(len(result["selected_outputs"]["sft"]), 1)
+        self.assertNotIn("near_duplicate_content", result["quality_stats"]["dedupe"])
+
+    def test_selection_manifest_records_dedupe_config(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            self.write_process_records(day, [
+                {
+                    "request_id": "request-0",
+                    "prompt": "请写 Python 代码打印 manifest",
+                    "response": "print('manifest')",
+                },
+            ])
+
+            result = pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                near_duplicate_simhash_hamming=5,
+            )
+
+            selection_manifest = json.loads(
+                (output_root / "reports" / "2026-07-15.selection_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["selection"]["dedupe_enabled"])
+            self.assertEqual(result["selection"]["dedupe_config"]["near_duplicate_simhash_hamming"], 5)
+            self.assertTrue(selection_manifest["selection"]["dedupe_enabled"])
+            self.assertEqual(
+                selection_manifest["selection"]["dedupe_config"]["near_duplicate_simhash_hamming"],
+                5,
+            )
 
     def test_router_duplicate_does_not_filter_distinct_sft_response(self):
         pipeline = load_pipeline_module()

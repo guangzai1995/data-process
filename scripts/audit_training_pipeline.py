@@ -843,6 +843,31 @@ def tool_name_set(canonical):
     return names
 
 
+SELECTION_DEDUPE_CONFIG_KEYS = (
+    "enable_dedupe",
+    "enable_near_duplicate_dedupe",
+    "enable_debug_noise_filter",
+    "near_duplicate_simhash_hamming",
+    "near_duplicate_min_chars",
+    "near_duplicate_min_tokens",
+    "near_duplicate_jaccard",
+    "max_near_duplicate_representatives_per_bucket",
+    "max_debug_control_repeats_per_session",
+    "max_debug_task_burst_per_session",
+    "debug_burst_window_minutes",
+    "max_dedupe_seen_hashes",
+    "max_dedupe_user_session_windows",
+    "max_near_duplicate_buckets",
+)
+
+
+def selection_dedupe_config(config):
+    return {
+        key: copy.deepcopy(config.get(key))
+        for key in SELECTION_DEDUPE_CONFIG_KEYS
+    }
+
+
 def default_selection_config(**overrides):
     config = {
         "selected_min_score": 0.6,
@@ -2033,6 +2058,39 @@ def write_canonical_exports(handles, date, canonical):
         )
 
 
+SAFE_DEDUPE_SCALAR_FIELDS = set([
+    "bucket",
+    "normalized_prompt_hash",
+    "simhash64",
+    "decision",
+    "matched_reason",
+])
+SAFE_DEDUPE_LIST_FIELDS = set([
+    "matched_reasons",
+    "suppressed_use_for",
+])
+
+
+def safe_dedupe_metadata(dedupe):
+    if not isinstance(dedupe, dict):
+        return {}
+    safe = {}
+    for key in sorted(SAFE_DEDUPE_SCALAR_FIELDS):
+        value = dedupe.get(key)
+        if isinstance(value, str):
+            safe[key] = value
+    token_count = dedupe.get("token_count")
+    if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
+        safe["token_count"] = token_count
+    for key in sorted(SAFE_DEDUPE_LIST_FIELDS):
+        value = dedupe.get(key)
+        if isinstance(value, list):
+            strings = [item for item in value if isinstance(item, str)]
+            if strings:
+                safe[key] = strings
+    return safe
+
+
 def quality_export_record(canonical):
     quality = canonical.get("quality", {})
     record = {
@@ -2049,6 +2107,7 @@ def quality_export_record(canonical):
             "risk_labels": quality.get("risk_labels") or [],
             "reject_reasons": quality.get("reject_reasons") or [],
             "use_for": quality.get("use_for") or [],
+            "dedupe": safe_dedupe_metadata(quality.get("dedupe") or {}),
         },
         "features": {
             "route_label": canonical.get("task", {}).get("route_label"),
@@ -2424,6 +2483,8 @@ def apply_dedupe_annotation(
         apply_debug_noise_filters(canonical, config, state, text, normalized)
     if quality.get("reject_reasons") or not apply_near_duplicates:
         return canonical
+    if not quality.get("use_for"):
+        return canonical
     if not config.get("enable_near_duplicate_dedupe", True):
         return canonical
     if len(normalized) < config.get("near_duplicate_min_chars", 16):
@@ -2526,6 +2587,9 @@ def init_selection_report_state():
         "score_counts": {},
         "combo_counts": {},
         "reject_counts": {},
+        "risk_counts": {},
+        "dedupe_counts": {},
+        "dedupe_rejected_records": 0,
         "user_task_buckets": {},
     }
 
@@ -2542,8 +2606,22 @@ def update_selection_report_state(state, canonical):
     add_count(state["score_counts"], score)
     add_count(state["combo_counts"], "%s|%s|%s" % (route, intent, score))
     add_count(state["user_task_buckets"], "%s|%s|%s" % (route, intent, score))
+    for risk in quality.get("risk_labels") or []:
+        add_count(state["risk_counts"], risk)
+        if risk == "dedupe_state_saturated":
+            add_count(state["dedupe_counts"], "state_saturated")
+    dedupe_rejected = False
     for reason in quality.get("reject_reasons") or []:
         add_count(state["reject_counts"], reason)
+        if reason in DEDUPE_REJECT_REASONS:
+            add_count(state["dedupe_counts"], reason)
+            dedupe_rejected = True
+    if dedupe_rejected:
+        state["dedupe_rejected_records"] = state.get("dedupe_rejected_records", 0) + 1
+
+
+def dedupe_rejected_from_report_state(state):
+    return state.get("dedupe_rejected_records", 0)
 
 
 def quality_stats_from_state(state, k_threshold):
@@ -2555,6 +2633,8 @@ def quality_stats_from_state(state, k_threshold):
         "score_counts": k_suppressed_counts(state.get("score_counts", {}), k_threshold),
         "route_intent_score_counts": k_suppressed_counts(state.get("combo_counts", {}), k_threshold),
         "reject_reasons": k_suppressed_counts(state.get("reject_counts", {}), k_threshold),
+        "risk_labels": k_suppressed_counts(state.get("risk_counts", {}), k_threshold),
+        "dedupe": k_suppressed_counts(state.get("dedupe_counts", {}), k_threshold),
         "k_threshold": k_threshold,
     }
 
@@ -2700,18 +2780,27 @@ def consider_selected_record(canonical, config, state, dedupe_state=None):
             state["high_value_task_counts"][high_value_count_key] = state["high_value_task_counts"].get(high_value_count_key, 0) + 1
 
 
-def build_selected_outputs(annotated_records, episodes, config):
+def build_single_turn_selected_outputs(annotated_records, config):
     state = init_selected_export_state()
     dedupe_state = init_dedupe_state(config)
     for canonical in sorted(annotated_records, key=selection_rank_key):
         consider_selected_record(canonical, config, state, dedupe_state)
+    return state["outputs"]
+
+
+def append_selected_multi_turn_outputs(selected_outputs, episodes, annotated_records, config):
     sample_by_id = {canonical.get("sample_id"): canonical for canonical in annotated_records}
     if not config.get("disable_episodes"):
         for episode in episodes:
             record = export_selected_multi_turn_sft(episode, sample_by_id, config)
             if record is not None:
-                state["outputs"]["multi_turn_sft"].append(record)
-    return state["outputs"]
+                selected_outputs["multi_turn_sft"].append(record)
+    return selected_outputs
+
+
+def build_selected_outputs(annotated_records, episodes, config):
+    outputs = build_single_turn_selected_outputs(annotated_records, config)
+    return append_selected_multi_turn_outputs(outputs, episodes, annotated_records, config)
 
 
 def iter_jsonl_records(path):
@@ -2724,6 +2813,7 @@ def iter_jsonl_records(path):
 def process_spooled_selection_records(spool_path, config, date, handles=None):
     report_state = init_selection_report_state()
     selected_state = init_selected_export_state()
+    dedupe_state = init_dedupe_state(config)
     current_episode = []
 
     def flush_episode():
@@ -2734,8 +2824,10 @@ def process_spooled_selection_records(spool_path, config, date, handles=None):
         del current_episode[:]
 
     for canonical in iter_jsonl_records(spool_path):
+        refresh_selection_use_for(canonical, config)
+        apply_dedupe_annotation(canonical, config, dedupe_state)
+        consider_selected_record(canonical, config, selected_state, dedupe_state)
         update_selection_report_state(report_state, canonical)
-        consider_selected_record(canonical, config, selected_state)
         if handles is not None and not config.get("disable_diagnostics"):
             write_stream_record(handles, "quality/%s.jsonl" % date, quality_export_record(canonical))
         if not config.get("disable_episodes"):
@@ -2752,6 +2844,7 @@ def process_spooled_selection_records(spool_path, config, date, handles=None):
         "selected_outputs": selected_state["outputs"],
         "quality_stats": quality_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
         "user_task_stats": user_task_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
+        "dedupe_rejected": dedupe_rejected_from_report_state(report_state),
     }
 
 
@@ -2765,6 +2858,7 @@ def build_selection_manifest(
     started_at,
     finished_at,
     candidate_count=None,
+    dedupe_rejected=0,
 ):
     enabled = enabled_output_relatives(date, config)
     if candidate_count is None:
@@ -2806,6 +2900,9 @@ def build_selection_manifest(
             "max_selection_memory_mb": config.get("max_selection_memory_mb"),
             "selected_counts": {key: len(value) for key, value in selected_outputs.items()},
             "candidate_count": candidate_count,
+            "dedupe_enabled": bool(config.get("enable_dedupe")),
+            "dedupe_rejected": dedupe_rejected,
+            "dedupe_config": selection_dedupe_config(config),
         },
         "labelers": {
             "route_enabled": bool(config.get("enable_route_labeler")),
@@ -2988,6 +3085,20 @@ def process_date(
     max_selection_memory_mb=DEFAULT_MAX_SELECTION_MEMORY_MB,
     selection_mode="auto",
     k_threshold=DEFAULT_K_THRESHOLD,
+    disable_dedupe=False,
+    disable_near_duplicate_dedupe=False,
+    disable_debug_noise_filter=False,
+    near_duplicate_simhash_hamming=None,
+    near_duplicate_jaccard=None,
+    near_duplicate_min_chars=None,
+    near_duplicate_min_tokens=None,
+    max_near_duplicate_representatives_per_bucket=None,
+    max_debug_control_repeats_per_session=None,
+    max_debug_task_burst_per_session=None,
+    debug_burst_window_minutes=None,
+    max_dedupe_seen_hashes=None,
+    max_dedupe_user_session_windows=None,
+    max_near_duplicate_buckets=None,
 ):
     validate_date_string(date)
     if selection_mode not in ("auto", "in-memory", "spool"):
@@ -3019,6 +3130,20 @@ def process_date(
         max_selection_memory_mb=max_selection_memory_mb,
         selection_mode=selection_mode,
         k_threshold=k_threshold,
+        enable_dedupe=not bool(disable_dedupe),
+        enable_near_duplicate_dedupe=not bool(disable_near_duplicate_dedupe),
+        enable_debug_noise_filter=not bool(disable_debug_noise_filter),
+        near_duplicate_simhash_hamming=near_duplicate_simhash_hamming,
+        near_duplicate_jaccard=near_duplicate_jaccard,
+        near_duplicate_min_chars=near_duplicate_min_chars,
+        near_duplicate_min_tokens=near_duplicate_min_tokens,
+        max_near_duplicate_representatives_per_bucket=max_near_duplicate_representatives_per_bucket,
+        max_debug_control_repeats_per_session=max_debug_control_repeats_per_session,
+        max_debug_task_burst_per_session=max_debug_task_burst_per_session,
+        debug_burst_window_minutes=debug_burst_window_minutes,
+        max_dedupe_seen_hashes=max_dedupe_seen_hashes,
+        max_dedupe_user_session_windows=max_dedupe_user_session_windows,
+        max_near_duplicate_buckets=max_near_duplicate_buckets,
     )
     selection_enabled = not config.get("disable_selection") and not config.get("compat_output_set")
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
@@ -3045,6 +3170,7 @@ def process_date(
     candidate_count = 0
     quality_stats = quality_stats_from_state(init_selection_report_state(), k_threshold)
     user_task_stats = user_task_stats_from_state(init_selection_report_state(), k_threshold)
+    dedupe_rejected = 0
     try:
         if selection_enabled or not dry_run:
             lock_path = acquire_run_lock(output_root_path, date, run_id)
@@ -3123,16 +3249,22 @@ def process_date(
                 selected_outputs = spooled["selected_outputs"]
                 quality_stats = spooled["quality_stats"]
                 user_task_stats = spooled["user_task_stats"]
+                dedupe_rejected = spooled["dedupe_rejected"]
                 candidate_count = spooled["candidate_count"]
                 annotated_records = []
                 episodes = []
             else:
                 apply_dedupe_annotations_to_records(annotated_records, config)
+                selected_outputs = build_single_turn_selected_outputs(annotated_records, config)
                 episodes = build_episodes(annotated_records, config)
-                selected_outputs = build_selected_outputs(annotated_records, episodes, config)
+                append_selected_multi_turn_outputs(selected_outputs, episodes, annotated_records, config)
                 candidate_count = len(annotated_records)
-                quality_stats = build_quality_stats(annotated_records, k_threshold)
-                user_task_stats = build_user_task_stats(annotated_records, k_threshold)
+                report_state = init_selection_report_state()
+                for canonical in annotated_records:
+                    update_selection_report_state(report_state, canonical)
+                quality_stats = quality_stats_from_state(report_state, k_threshold)
+                user_task_stats = user_task_stats_from_state(report_state, k_threshold)
+                dedupe_rejected = dedupe_rejected_from_report_state(report_state)
         finished_at = datetime.datetime.utcnow().isoformat() + "Z"
         manifest = {
             "date": date,
@@ -3153,6 +3285,9 @@ def process_date(
                 "mode_used": mode_used,
                 "candidate_count": candidate_count,
                 "selected_counts": {key: len(value) for key, value in selected_outputs.items()},
+                "dedupe_enabled": bool(config.get("enable_dedupe")),
+                "dedupe_rejected": dedupe_rejected,
+                "dedupe_config": selection_dedupe_config(config),
             },
         }
         if not dry_run:
@@ -3177,7 +3312,18 @@ def process_date(
             if selection_enabled:
                 write_json_file(path_under(tmp_root, "reports/%s.quality_stats.json" % date), quality_stats)
                 write_json_file(path_under(tmp_root, "reports/%s.user_task_stats.json" % date), user_task_stats)
-                selection_manifest = build_selection_manifest(date, config, mode_used, run_id, annotated_records, selected_outputs, started_at, finished_at, candidate_count=candidate_count)
+                selection_manifest = build_selection_manifest(
+                    date,
+                    config,
+                    mode_used,
+                    run_id,
+                    annotated_records,
+                    selected_outputs,
+                    started_at,
+                    finished_at,
+                    candidate_count=candidate_count,
+                    dedupe_rejected=dedupe_rejected,
+                )
                 write_json_file(path_under(tmp_root, "reports/%s.selection_manifest.json" % date), selection_manifest)
             commit_started = True
             commit_tmp_outputs(output_root_path, date, enabled_output_relatives(date, config), run_id=run_id)
@@ -3241,6 +3387,20 @@ def positive_float(value):
     return parsed
 
 
+def bounded_float_0_1(value):
+    parsed = positive_float(value)
+    if parsed > 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def simhash_hamming_int(value):
+    parsed = non_negative_int(value)
+    if parsed > 64:
+        raise argparse.ArgumentTypeError("must be between 0 and 64")
+    return parsed
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="Clean audit logs into training-ready datasets."
@@ -3275,6 +3435,20 @@ def parse_args(argv):
     parser.add_argument("--max-selection-memory-mb", type=non_negative_int, default=DEFAULT_MAX_SELECTION_MEMORY_MB)
     parser.add_argument("--selection-mode", choices=("auto", "in-memory", "spool"), default="auto")
     parser.add_argument("--k-threshold", type=non_negative_int, default=DEFAULT_K_THRESHOLD)
+    parser.add_argument("--disable-dedupe", action="store_true")
+    parser.add_argument("--disable-near-duplicate-dedupe", action="store_true")
+    parser.add_argument("--disable-debug-noise-filter", action="store_true")
+    parser.add_argument("--near-duplicate-simhash-hamming", type=simhash_hamming_int, default=4)
+    parser.add_argument("--near-duplicate-jaccard", type=bounded_float_0_1, default=0.88)
+    parser.add_argument("--near-duplicate-min-chars", type=non_negative_int, default=16)
+    parser.add_argument("--near-duplicate-min-tokens", type=non_negative_int, default=4)
+    parser.add_argument("--max-near-duplicate-representatives-per-bucket", type=non_negative_int, default=128)
+    parser.add_argument("--max-debug-control-repeats-per-session", type=non_negative_int, default=2)
+    parser.add_argument("--max-debug-task-burst-per-session", type=non_negative_int, default=8)
+    parser.add_argument("--debug-burst-window-minutes", type=positive_float, default=20)
+    parser.add_argument("--max-dedupe-seen-hashes", type=non_negative_int, default=1000000)
+    parser.add_argument("--max-dedupe-user-session-windows", type=non_negative_int, default=100000)
+    parser.add_argument("--max-near-duplicate-buckets", type=non_negative_int, default=50000)
     args = parser.parse_args(argv)
     if args.compat_output_set and (args.enable_route_labeler or args.enable_quality_labeler or args.enable_label_snippets):
         parser.error("--compat-output-set conflicts with model labeler and snippet flags")
@@ -3336,6 +3510,20 @@ def main(argv=None):
             max_selection_memory_mb=args.max_selection_memory_mb,
             selection_mode=args.selection_mode,
             k_threshold=args.k_threshold,
+            disable_dedupe=args.disable_dedupe,
+            disable_near_duplicate_dedupe=args.disable_near_duplicate_dedupe,
+            disable_debug_noise_filter=args.disable_debug_noise_filter,
+            near_duplicate_simhash_hamming=args.near_duplicate_simhash_hamming,
+            near_duplicate_jaccard=args.near_duplicate_jaccard,
+            near_duplicate_min_chars=args.near_duplicate_min_chars,
+            near_duplicate_min_tokens=args.near_duplicate_min_tokens,
+            max_near_duplicate_representatives_per_bucket=args.max_near_duplicate_representatives_per_bucket,
+            max_debug_control_repeats_per_session=args.max_debug_control_repeats_per_session,
+            max_debug_task_burst_per_session=args.max_debug_task_burst_per_session,
+            debug_burst_window_minutes=args.debug_burst_window_minutes,
+            max_dedupe_seen_hashes=args.max_dedupe_seen_hashes,
+            max_dedupe_user_session_windows=args.max_dedupe_user_session_windows,
+            max_near_duplicate_buckets=args.max_near_duplicate_buckets,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0
