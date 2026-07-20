@@ -2147,6 +2147,230 @@ class SelectionDedupeTest(unittest.TestCase):
             self.assertEqual(len(selected_sft), 1)
             self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
 
+    def test_sort_spool_jsonl_by_key_flushes_chunks_on_byte_budget(self):
+        pipeline = load_pipeline_module()
+        original_writer = pipeline.write_sorted_spool_chunk
+        chunks = []
+
+        def recording_writer(records, key_fn, spool_path, label):
+            chunks.append({
+                "count": len(records),
+                "bytes": sum(pipeline.estimate_record_size(record) for record in records),
+            })
+            return original_writer(records, key_fn, spool_path, label)
+
+        try:
+            pipeline.write_sorted_spool_chunk = recording_writer
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                spool_path = root / "candidates.jsonl"
+                records = [
+                    {"sort": 3, "payload": "x" * 2048},
+                    {"sort": 2, "payload": "y" * 2048},
+                    {"sort": 1, "payload": "z" * 2048},
+                ]
+                with spool_path.open("w", encoding="utf-8") as handle:
+                    for record in records:
+                        pipeline.write_jsonl_record(handle, record)
+                config = pipeline.default_selection_config(
+                    max_in_memory_samples=100,
+                    max_selection_memory_mb=0,
+                )
+
+                sorted_path = pipeline.sort_spool_jsonl_by_key(
+                    spool_path,
+                    lambda record: record["sort"],
+                    config,
+                    "byte_budget",
+                )
+
+                self.assertEqual([row["sort"] for row in read_jsonl(sorted_path)], [1, 2, 3])
+                self.assertGreater(len(chunks), 1)
+                self.assertTrue(all(chunk["count"] == 1 for chunk in chunks))
+        finally:
+            pipeline.write_sorted_spool_chunk = original_writer
+
+    def test_write_sorted_spool_chunk_removes_partial_file_on_failure(self):
+        pipeline = load_pipeline_module()
+        original_write_jsonl_record = pipeline.write_jsonl_record
+
+        def failing_write_jsonl_record(handle, record):
+            handle.write("partial")
+            raise RuntimeError("chunk write failed")
+
+        try:
+            pipeline.write_jsonl_record = failing_write_jsonl_record
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                spool_path = root / "candidates.jsonl"
+                spool_path.write_text('{"original": true}\n', encoding="utf-8")
+
+                with self.assertRaises(RuntimeError):
+                    pipeline.write_sorted_spool_chunk(
+                        [{"sort": 1}],
+                        lambda record: record["sort"],
+                        spool_path,
+                        "event_order.chunk",
+                    )
+
+                self.assertEqual([path.name for path in root.iterdir()], ["candidates.jsonl"])
+        finally:
+            pipeline.write_jsonl_record = original_write_jsonl_record
+
+    def test_merge_sorted_spool_chunks_removes_partial_output_on_failure(self):
+        pipeline = load_pipeline_module()
+        original_write_jsonl_record = pipeline.write_jsonl_record
+
+        def failing_write_jsonl_record(handle, record):
+            handle.write("partial")
+            raise RuntimeError("merge write failed")
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                chunk_a = root / "chunk-a.jsonl"
+                chunk_b = root / "chunk-b.jsonl"
+                output_path = root / "candidates.jsonl.event_order.merge0_0.failure.jsonl"
+                with chunk_a.open("w", encoding="utf-8") as handle:
+                    original_write_jsonl_record(handle, {"sort": 1})
+                with chunk_b.open("w", encoding="utf-8") as handle:
+                    original_write_jsonl_record(handle, {"sort": 2})
+
+                pipeline.write_jsonl_record = failing_write_jsonl_record
+                with self.assertRaises(RuntimeError):
+                    pipeline.merge_sorted_spool_chunks(
+                        [chunk_a, chunk_b],
+                        lambda record: record["sort"],
+                        output_path,
+                    )
+
+                self.assertTrue(chunk_a.exists())
+                self.assertTrue(chunk_b.exists())
+                self.assertFalse(output_path.exists())
+        finally:
+            pipeline.write_jsonl_record = original_write_jsonl_record
+
+    def test_spooled_selection_skips_episode_sort_without_diagnostic_handles(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.default_selection_config(k_threshold=1)
+        original_sort = pipeline.sort_spool_jsonl_by_key
+        labels = []
+
+        def recording_sort(source_path, key_fn, config_arg, label, *args, **kwargs):
+            labels.append(label)
+            return original_sort(source_path, key_fn, config_arg, label, *args, **kwargs)
+
+        try:
+            pipeline.sort_spool_jsonl_by_key = recording_sort
+            with tempfile.TemporaryDirectory() as tmp:
+                spool_path = pathlib.Path(tmp) / "candidates.jsonl"
+                record = self.make_annotated_record(
+                    pipeline,
+                    "请写 Python 代码打印 spool",
+                    request_id="request-spool",
+                    response="print('spool')",
+                    timestamp_ms=1000,
+                    config=config,
+                )
+                with spool_path.open("w", encoding="utf-8") as handle:
+                    pipeline.write_jsonl_record(handle, record)
+
+                result = pipeline.process_spooled_selection_records(
+                    spool_path,
+                    config,
+                    "2026-07-15",
+                    handles=None,
+                )
+
+                self.assertEqual(len(result["selected_outputs"]["sft"]), 1)
+                self.assertNotIn("episode_order", labels)
+        finally:
+            pipeline.sort_spool_jsonl_by_key = original_sort
+
+    def test_spool_normalized_duplicate_keeps_same_ranked_winner_as_in_memory(self):
+        pipeline = load_pipeline_module()
+        original_load_label_config = pipeline.load_label_config
+        original_call_label_model = pipeline.call_label_model
+
+        def fake_load_label_config():
+            return {"enabled": True, "max_input_chars": 1200}
+
+        def fake_call_label_model(payload, label_config, parser=pipeline.parse_quality_label_response):
+            prompt = payload.get("sample", {}).get("user_snippet", "")
+            score = 0.65 if "42" in prompt else 0.95
+            return {
+                "quality_score": score,
+                "value_labels": [],
+                "risk_labels": [],
+                "reason": "test_score",
+            }, None
+
+        try:
+            pipeline.load_label_config = fake_load_label_config
+            pipeline.call_label_model = fake_call_label_model
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                day = input_root / "2026-07-15"
+                low_prompt = "请修复第 42 行 Python 报错"
+                high_prompt = "请修复第 43 行 Python 报错"
+                self.write_process_records(day, [
+                    {
+                        "request_id": "request-low",
+                        "prompt": low_prompt,
+                        "response": "可以检查异常栈并修复参数。",
+                        "timestamp_ms": 1000,
+                    },
+                    {
+                        "request_id": "request-high",
+                        "prompt": high_prompt,
+                        "response": "可以检查异常栈并修复参数。",
+                        "timestamp_ms": 2000,
+                    },
+                ])
+
+                for mode in ["in-memory", "spool"]:
+                    pipeline.process_date(
+                        str(input_root),
+                        str(root / ("out-" + mode)),
+                        "2026-07-15",
+                        selection_mode=mode,
+                        enable_quality_labeler=True,
+                        enable_label_snippets=True,
+                        k_threshold=1,
+                    )
+
+                in_memory_selected = read_jsonl(
+                    root / "out-in-memory" / "selected" / "sft" / "2026-07-15.jsonl"
+                )
+                spool_selected = read_jsonl(
+                    root / "out-spool" / "selected" / "sft" / "2026-07-15.jsonl"
+                )
+                in_memory_quality = read_jsonl(root / "out-in-memory" / "quality" / "2026-07-15.jsonl")
+                spool_quality = read_jsonl(root / "out-spool" / "quality" / "2026-07-15.jsonl")
+
+                self.assertEqual(len(in_memory_selected), 1)
+                self.assertEqual(len(spool_selected), 1)
+                self.assertEqual(in_memory_selected[0]["input"], high_prompt)
+                self.assertEqual(spool_selected[0]["input"], high_prompt)
+                self.assertTrue(
+                    any(
+                        row["quality"]["final_quality_score"] == 0.65
+                        and "normalized_duplicate_content" in row["reject_reasons"]
+                        for row in in_memory_quality
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        row["quality"]["final_quality_score"] == 0.65
+                        and "normalized_duplicate_content" in row["reject_reasons"]
+                        for row in spool_quality
+                    )
+                )
+        finally:
+            pipeline.load_label_config = original_load_label_config
+            pipeline.call_label_model = original_call_label_model
+
     def test_spool_near_duplicate_ignores_non_selected_representatives(self):
         pipeline = load_pipeline_module()
         config = pipeline.default_selection_config(k_threshold=1, selected_min_score=0.85)

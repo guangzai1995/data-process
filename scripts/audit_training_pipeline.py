@@ -21,6 +21,7 @@ import calendar
 import copy
 import datetime
 import errno
+import heapq
 import hashlib
 import hmac
 import json
@@ -2810,43 +2811,217 @@ def iter_jsonl_records(path):
                 yield json.loads(line)
 
 
+def spool_sort_chunk_size(config):
+    try:
+        value = int(config.get("max_in_memory_samples") or DEFAULT_MAX_IN_MEMORY_SAMPLES)
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_IN_MEMORY_SAMPLES
+    return max(1, value)
+
+
+def spool_sort_byte_budget(config):
+    try:
+        value = int(config.get("max_selection_memory_mb", DEFAULT_MAX_SELECTION_MEMORY_MB))
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_SELECTION_MEMORY_MB
+    return max(0, value) * 1024 * 1024
+
+
+def spool_temp_path(spool_path, label):
+    spool_path = pathlib.Path(spool_path)
+    return spool_path.with_name("%s.%s.%s.jsonl" % (spool_path.name, label, uuid.uuid4().hex[:12]))
+
+
+def unlink_if_exists(path):
+    try:
+        pathlib.Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def write_sorted_spool_chunk(records, key_fn, spool_path, label):
+    records.sort(key=key_fn)
+    chunk_path = spool_temp_path(spool_path, label)
+    try:
+        with chunk_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                write_jsonl_record(handle, record)
+        return chunk_path
+    except Exception:
+        unlink_if_exists(chunk_path)
+        raise
+
+
+def merge_sorted_spool_chunks(chunk_paths, key_fn, output_path):
+    handles = []
+    heap = []
+    try:
+        for index, chunk_path in enumerate(chunk_paths):
+            handle = pathlib.Path(chunk_path).open("r", encoding="utf-8")
+            handles.append(handle)
+            line = handle.readline()
+            if line.strip():
+                record = json.loads(line)
+                heapq.heappush(heap, (key_fn(record), index, record))
+        with pathlib.Path(output_path).open("w", encoding="utf-8") as output:
+            while heap:
+                _key, index, record = heapq.heappop(heap)
+                write_jsonl_record(output, record)
+                line = handles[index].readline()
+                if line.strip():
+                    next_record = json.loads(line)
+                    heapq.heappush(heap, (key_fn(next_record), index, next_record))
+    except Exception:
+        unlink_if_exists(output_path)
+        raise
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def sort_spool_jsonl_by_key(source_path, key_fn, config, label, max_merge_files=64):
+    source_path = pathlib.Path(source_path)
+    chunk_size = spool_sort_chunk_size(config)
+    chunk_byte_budget = spool_sort_byte_budget(config)
+    created_paths = []
+    final_path = spool_temp_path(source_path, label)
+    try:
+        records = []
+        records_bytes = 0
+        for record in iter_jsonl_records(source_path):
+            record_bytes = estimate_record_size(record)
+            if records and (
+                len(records) >= chunk_size
+                or records_bytes + record_bytes > chunk_byte_budget
+            ):
+                chunk_path = write_sorted_spool_chunk(records, key_fn, source_path, "%s.chunk" % label)
+                created_paths.append(chunk_path)
+                records = []
+                records_bytes = 0
+            records.append(record)
+            records_bytes += record_bytes
+        if records:
+            chunk_path = write_sorted_spool_chunk(records, key_fn, source_path, "%s.chunk" % label)
+            created_paths.append(chunk_path)
+        if not created_paths:
+            final_path.open("w", encoding="utf-8").close()
+            return final_path
+        merge_paths = list(created_paths)
+        pass_index = 0
+        while len(merge_paths) > 1:
+            next_paths = []
+            for group_index in range(0, len(merge_paths), max_merge_files):
+                group = merge_paths[group_index:group_index + max_merge_files]
+                merged_path = spool_temp_path(source_path, "%s.merge%d_%d" % (label, pass_index, group_index // max_merge_files))
+                merge_sorted_spool_chunks(group, key_fn, merged_path)
+                next_paths.append(merged_path)
+                created_paths.append(merged_path)
+            for chunk_path in merge_paths:
+                unlink_if_exists(chunk_path)
+            merge_paths = next_paths
+            pass_index += 1
+        shutil.move(str(merge_paths[0]), str(final_path))
+        return final_path
+    except Exception:
+        unlink_if_exists(final_path)
+        for created_path in created_paths:
+            unlink_if_exists(created_path)
+        raise
+
+
 def process_spooled_selection_records(spool_path, config, date, handles=None):
     report_state = init_selection_report_state()
     selected_state = init_selected_export_state()
     dedupe_state = init_dedupe_state(config)
-    selected_dedupe_state = dedupe_state if config.get("enable_dedupe", True) else None
-    current_episode = []
+    selected_dedupe_state = init_dedupe_state(config) if config.get("enable_dedupe", True) else None
+    temp_paths = []
 
-    def flush_episode():
-        if not current_episode:
-            return
+    try:
+        event_sorted_path = sort_spool_jsonl_by_key(
+            spool_path,
+            dedupe_event_order_key,
+            config,
+            "event_order",
+        )
+        temp_paths.append(event_sorted_path)
+        debug_path = spool_temp_path(spool_path, "debug_applied")
+        temp_paths.append(debug_path)
+        with debug_path.open("w", encoding="utf-8") as handle:
+            for canonical in iter_jsonl_records(event_sorted_path):
+                refresh_selection_use_for(canonical, config)
+                apply_dedupe_annotation(
+                    canonical,
+                    config,
+                    dedupe_state,
+                    apply_debug_filters=True,
+                    apply_near_duplicates=False,
+                )
+                write_jsonl_record(handle, canonical)
+
+        rank_sorted_path = sort_spool_jsonl_by_key(
+            debug_path,
+            selection_rank_key,
+            config,
+            "selection_rank",
+        )
+        temp_paths.append(rank_sorted_path)
+        final_path = spool_temp_path(spool_path, "final_selection")
+        temp_paths.append(final_path)
+        with final_path.open("w", encoding="utf-8") as handle:
+            for canonical in iter_jsonl_records(rank_sorted_path):
+                refresh_selection_use_for(canonical, config)
+                apply_dedupe_annotation(
+                    canonical,
+                    config,
+                    dedupe_state,
+                    apply_debug_filters=False,
+                    apply_near_duplicates=True,
+                    count_checked=False,
+                )
+                consider_selected_record(canonical, config, selected_state, selected_dedupe_state)
+                write_jsonl_record(handle, canonical)
+
+        for canonical in iter_jsonl_records(final_path):
+            update_selection_report_state(report_state, canonical)
+            if handles is not None and not config.get("disable_diagnostics"):
+                write_stream_record(handles, "quality/%s.jsonl" % date, quality_export_record(canonical))
+
         if handles is not None and not config.get("disable_diagnostics") and not config.get("disable_episodes"):
-            write_stream_record(handles, "episodes/%s.jsonl" % date, build_episode_record(current_episode))
-        del current_episode[:]
+            episode_sorted_path = sort_spool_jsonl_by_key(
+                final_path,
+                episode_sort_key,
+                config,
+                "episode_order",
+            )
+            temp_paths.append(episode_sorted_path)
+            current_episode = []
 
-    for canonical in iter_jsonl_records(spool_path):
-        refresh_selection_use_for(canonical, config)
-        apply_dedupe_annotation(canonical, config, dedupe_state)
-        consider_selected_record(canonical, config, selected_state, selected_dedupe_state)
-        update_selection_report_state(report_state, canonical)
-        if handles is not None and not config.get("disable_diagnostics"):
-            write_stream_record(handles, "quality/%s.jsonl" % date, quality_export_record(canonical))
-        if not config.get("disable_episodes"):
-            if not current_episode:
-                current_episode.append(canonical)
-            elif same_episode(current_episode[-1], canonical):
-                current_episode.append(canonical)
-            else:
-                flush_episode()
-                current_episode.append(canonical)
-    flush_episode()
-    return {
-        "candidate_count": report_state["total"],
-        "selected_outputs": selected_state["outputs"],
-        "quality_stats": quality_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
-        "user_task_stats": user_task_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
-        "dedupe_rejected": dedupe_rejected_from_report_state(report_state),
-    }
+            def flush_episode():
+                if not current_episode:
+                    return
+                write_stream_record(handles, "episodes/%s.jsonl" % date, build_episode_record(current_episode))
+                del current_episode[:]
+
+            for canonical in iter_jsonl_records(episode_sorted_path):
+                if not current_episode:
+                    current_episode.append(canonical)
+                elif same_episode(current_episode[-1], canonical, config):
+                    current_episode.append(canonical)
+                else:
+                    flush_episode()
+                    current_episode.append(canonical)
+            flush_episode()
+
+        return {
+            "candidate_count": report_state["total"],
+            "selected_outputs": selected_state["outputs"],
+            "quality_stats": quality_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
+            "user_task_stats": user_task_stats_from_state(report_state, config.get("k_threshold", DEFAULT_K_THRESHOLD)),
+            "dedupe_rejected": dedupe_rejected_from_report_state(report_state),
+        }
+    finally:
+        for temp_path in temp_paths:
+            unlink_if_exists(temp_path)
 
 
 def build_selection_manifest(
