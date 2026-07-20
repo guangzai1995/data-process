@@ -2650,6 +2650,11 @@ def user_task_stats_from_state(state, k_threshold):
 
 
 
+def selected_episode_export_id(episode_id_internal, key):
+    digest = hmac_digest(episode_id_internal, key, 16)
+    return "ep%sx%s" % (digest[:8], digest[8:])
+
+
 def export_selected_multi_turn_sft(episode, sample_by_id, config):
     if not episode.get("eligible_for_selected_multi_turn"):
         return None
@@ -2671,7 +2676,7 @@ def export_selected_multi_turn_sft(episode, sample_by_id, config):
         messages.append({"role": "assistant", "content": assistant_text})
     record = {
         "schema_version": SELECTED_SCHEMA_VERSION,
-        "episode_export_id": hmac_digest(episode.get("episode_id_internal"), str(uuid.uuid4()), 16),
+        "episode_export_id": selected_episode_export_id(episode.get("episode_id_internal"), str(uuid.uuid4())),
         "messages": messages,
         "metadata": {
             "source_date": episode.get("source_date"),

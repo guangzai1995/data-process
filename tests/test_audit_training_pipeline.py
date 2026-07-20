@@ -2035,6 +2035,57 @@ class SelectionDedupeTest(unittest.TestCase):
             self.assertTrue(any("duplicate_content" in row["reject_reasons"] for row in quality))
             self.assertFalse(any(episode["eligible_for_selected_multi_turn"] for episode in episodes))
 
+    def test_multi_turn_export_id_cannot_look_like_bank_card(self):
+        pipeline = load_pipeline_module()
+        fixed_key = "158e817c-62c4-4622-a011-7ba0dbeeb184"
+        self.assertEqual(
+            pipeline.hmac_digest("episode-id-for-test", fixed_key, 16),
+            "5327239440106062",
+        )
+        original_uuid4 = pipeline.uuid.uuid4
+
+        def canonical(sample_id, prompt, response):
+            return {
+                "sample_id": sample_id,
+                "request": {"messages": [{"role": "user", "content": prompt}]},
+                "response": {"message": {"content": response}},
+                "quality": {"final_quality_score": 0.9, "reject_reasons": []},
+            }
+
+        episode = {
+            "episode_id_internal": "episode-id-for-test",
+            "eligible_for_selected_multi_turn": True,
+            "source_date": "2026-07-15",
+            "turn_count": 2,
+            "route_label": "code_generation",
+            "intent_label": "write_code",
+            "turns": [
+                {"sample_id": "sample-1"},
+                {"sample_id": "sample-2"},
+            ],
+        }
+        sample_by_id = {
+            "sample-1": canonical("sample-1", "请写 Python 代码打印 hello", "print('hello')"),
+            "sample-2": canonical("sample-2", "请解释这段代码", "它会打印 hello。"),
+        }
+
+        try:
+            pipeline.uuid.uuid4 = lambda: fixed_key
+            try:
+                record = pipeline.export_selected_multi_turn_sft(
+                    episode,
+                    sample_by_id,
+                    pipeline.default_selection_config(),
+                )
+            except ValueError as exc:
+                self.fail("episode_export_id should not trip leakage scan: %s" % exc)
+        finally:
+            pipeline.uuid.uuid4 = original_uuid4
+
+        ok, reason = pipeline.leakage_scan_text(record["episode_export_id"], max_chars=200)
+        self.assertTrue(ok, reason)
+        self.assertNotEqual(record["episode_export_id"], "5327239440106062")
+
     def test_quality_dedupe_metadata_exports_only_safe_whitelisted_fields(self):
         pipeline = load_pipeline_module()
         canonical = {
