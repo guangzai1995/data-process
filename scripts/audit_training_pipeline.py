@@ -2735,6 +2735,13 @@ def suppress_selected_duplicate(canonical, dedupe_state, reason, kind):
     finalize_dedupe_suppression(canonical)
 
 
+def suppress_unsafe_selected_export(canonical, kind):
+    quality = canonical.setdefault("quality", {})
+    add_unique_list_value(quality.setdefault("risk_labels", []), "leakage_scan_failed")
+    add_unique_list_value(quality.setdefault("reject_reasons", []), "leakage_scan_failed")
+    quality["use_for"] = [value for value in quality.get("use_for", []) if value != kind]
+
+
 def consider_selected_record(canonical, config, state, dedupe_state=None):
     quality = canonical.get("quality", {})
     if quality.get("reject_reasons"):
@@ -2771,7 +2778,13 @@ def consider_selected_record(canonical, config, state, dedupe_state=None):
         if dedupe_state is not None and normalized_key in dedupe_state["normalized"][kind]:
             suppress_selected_duplicate(canonical, dedupe_state, "normalized_duplicate_content", kind)
             continue
-        record = exporter(canonical)
+        try:
+            record = exporter(canonical)
+        except ValueError as exc:
+            if not str(exc).startswith("unsafe export value:"):
+                raise
+            suppress_unsafe_selected_export(canonical, kind)
+            continue
         if record is None:
             continue
         state["outputs"][kind].append(record)

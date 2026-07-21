@@ -1650,6 +1650,34 @@ class SelectionPipelineTest(unittest.TestCase):
             self.assertEqual(selected_sft, [])
             self.assertIn("greeting_or_probe", quality[0]["reject_reasons"])
 
+    def test_unsafe_selected_text_is_rejected_without_crashing_pipeline(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            raw = sample_success_record()
+            raw["request_body"]["messages"] = [
+                {"role": "user", "content": "请分析 /var/log/private/app.log 并写 Python 修复脚本"}
+            ]
+            raw["response_body"]["choices"][0]["message"]["content"] = "可以先读取日志并定位异常。"
+            write_json(day / "u" / "s" / "001.json", raw)
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+            result = pipeline.process_date(str(input_root), str(output_root), "2026-07-15")
+
+            legacy_sft = read_jsonl(output_root / "sft" / "2026-07-15.jsonl")
+            selected_sft = read_jsonl(output_root / "selected" / "sft" / "2026-07-15.jsonl")
+            selected_router = read_jsonl(output_root / "selected" / "router_classification" / "2026-07-15.jsonl")
+            quality = read_jsonl(output_root / "quality" / "2026-07-15.jsonl")
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(len(legacy_sft), 1)
+            self.assertEqual(selected_sft, [])
+            self.assertEqual(selected_router, [])
+            self.assertIn("leakage_scan_failed", quality[0]["reject_reasons"])
+            self.assertIn("leakage_scan_failed", quality[0]["quality"]["risk_labels"])
+
     def test_selected_tool_use_requires_json_object_arguments(self):
         pipeline = load_pipeline_module()
         raw = sample_success_record()
