@@ -14,10 +14,12 @@ DEFAULT_K_THRESHOLD = 5
 DEFAULT_MAX_IN_MEMORY_SAMPLES = 50000
 DEFAULT_MAX_SELECTION_MEMORY_MB = 512
 DEFAULT_LOCK_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_LABEL_CACHE_MAX_ENTRIES = 10000
 
 
 import argparse
 import calendar
+import collections
 import copy
 import datetime
 import errno
@@ -1332,18 +1334,130 @@ def clamped_int(value, default, minimum, maximum):
     return min(maximum, max(minimum, parsed))
 
 
+def bool_from_env(value, default=True):
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
+def init_labeler_stats():
+    return {
+        "requests": {},
+        "cache_hits": {},
+        "cache_stores": {},
+        "cache_evictions": {},
+        "skips": {},
+        "errors": {},
+    }
+
+
+def record_labeler_stat(label_config, group, key):
+    stats = label_config.get("stats") if isinstance(label_config, dict) else None
+    if not isinstance(stats, dict):
+        return
+    counter = stats.setdefault(group, {})
+    counter[key] = counter.get(key, 0) + 1
+
+
+def labeler_task_name(label_payload):
+    if isinstance(label_payload, dict) and isinstance(label_payload.get("task"), str):
+        return label_payload.get("task")
+    return "unknown"
+
+
+def label_cache_key(label_payload, config):
+    return content_hash({
+        "base_url": config.get("base_url", ""),
+        "model": config.get("model", ""),
+        "payload": label_payload,
+    })
+
+
+def label_cache_enabled(config):
+    return bool(config.get("cache_enabled")) and isinstance(config.get("cache"), dict)
+
+
+def get_cached_label(label_payload, config):
+    if not label_cache_enabled(config):
+        return None
+    key = label_cache_key(label_payload, config)
+    cache = config["cache"]
+    if key not in cache:
+        return None
+    if hasattr(cache, "move_to_end"):
+        cache.move_to_end(key)
+    task = labeler_task_name(label_payload)
+    record_labeler_stat(config, "cache_hits", task)
+    return copy.deepcopy(cache[key])
+
+
+def store_cached_label(label_payload, config, parsed):
+    if not label_cache_enabled(config):
+        return
+    max_entries = int(config.get("cache_max_entries") or 0)
+    if max_entries <= 0:
+        return
+    key = label_cache_key(label_payload, config)
+    cache = config["cache"]
+    task = labeler_task_name(label_payload)
+    if key in cache:
+        cache[key] = copy.deepcopy(parsed)
+        if hasattr(cache, "move_to_end"):
+            cache.move_to_end(key)
+        return
+    while len(cache) >= max_entries:
+        if hasattr(cache, "popitem"):
+            try:
+                cache.popitem(last=False)
+            except TypeError:
+                first_key = next(iter(cache))
+                cache.pop(first_key, None)
+        else:
+            first_key = next(iter(cache))
+            cache.pop(first_key, None)
+        record_labeler_stat(config, "cache_evictions", task)
+    cache[key] = copy.deepcopy(parsed)
+    record_labeler_stat(config, "cache_stores", task)
+
+
+def labeler_stats_public(label_config):
+    stats = label_config.get("stats") if isinstance(label_config, dict) else None
+    if not isinstance(stats, dict):
+        stats = init_labeler_stats()
+    result = {
+        "enabled": bool(label_config.get("enabled")) if isinstance(label_config, dict) else False,
+        "cache_enabled": bool(label_config.get("cache_enabled")) if isinstance(label_config, dict) else False,
+        "cache_entries": len(label_config.get("cache") or {}) if isinstance(label_config, dict) else 0,
+        "cache_max_entries": label_config.get("cache_max_entries", 0) if isinstance(label_config, dict) else 0,
+    }
+    for group in ("requests", "cache_hits", "cache_stores", "cache_evictions", "skips", "errors"):
+        result[group] = dict(sorted((stats.get(group) or {}).items()))
+    return result
+
+
 def load_label_config(env=None):
     source = os.environ if env is None else env
     base_url = source.get("AUDIT_LABEL_BASE_URL", "").rstrip("/")
     api_key = source.get("AUDIT_LABEL_API_KEY", "")
     model = source.get("AUDIT_LABEL_MODEL", "")
     timeout = clamped_int(source.get("AUDIT_LABEL_TIMEOUT", "30"), 30, 1, 120)
+    cache_max_entries = clamped_int(
+        source.get("AUDIT_LABEL_CACHE_MAX_ENTRIES", str(DEFAULT_LABEL_CACHE_MAX_ENTRIES)),
+        DEFAULT_LABEL_CACHE_MAX_ENTRIES,
+        0,
+        1000000,
+    )
+    cache_enabled = bool_from_env(source.get("AUDIT_LABEL_CACHE"), True) and cache_max_entries > 0
     return {
         "enabled": bool(base_url and api_key and model),
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
         "timeout": timeout,
+        "cache_enabled": cache_enabled,
+        "cache_max_entries": cache_max_entries,
+        "cache": collections.OrderedDict(),
+        "stats": init_labeler_stats(),
     }
 
 
@@ -1489,12 +1603,18 @@ def parse_quality_label_response(text):
 
 
 def call_label_model(label_payload, config, urlopen=None, parser=parse_label_response):
+    task = labeler_task_name(label_payload)
     if not config.get("enabled"):
         return None, "labeler_disabled"
     try:
         verify_export_safe_value(label_payload, max_chars=config.get("max_input_chars", 1200))
     except ValueError:
-        return None, "labeler_payload_unsafe"
+        error = "labeler_payload_unsafe"
+        record_labeler_stat(config, "errors", "%s:%s" % (task, error))
+        return None, error
+    cached = get_cached_label(label_payload, config)
+    if cached is not None:
+        return cached, None
     body = json.dumps(
         {
             "model": config["model"],
@@ -1518,16 +1638,24 @@ def call_label_model(label_payload, config, urlopen=None, parser=parse_label_res
                 "Content-Type": "application/json",
             },
         )
+        record_labeler_stat(config, "requests", task)
         with opener(request, timeout=config["timeout"]) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
-        return None, "labeler_request_failed:%s" % exc.__class__.__name__
+        error = "labeler_request_failed:%s" % exc.__class__.__name__
+        record_labeler_stat(config, "errors", "%s:%s" % (task, error))
+        return None, error
     content = label_content_from_response(payload)
     if content is None:
-        return None, "labeler_invalid_response"
+        error = "labeler_invalid_response"
+        record_labeler_stat(config, "errors", "%s:%s" % (task, error))
+        return None, error
     parsed = parser(content)
     if parsed is None:
-        return None, "labeler_invalid_response"
+        error = "labeler_invalid_response"
+        record_labeler_stat(config, "errors", "%s:%s" % (task, error))
+        return None, error
+    store_cached_label(label_payload, config, parsed)
     return parsed, None
 
 
@@ -1798,6 +1926,36 @@ def update_stats_for_reject(stats, reject):
     stats["reject_reasons"][reason] = stats["reject_reasons"].get(reason, 0) + 1
 
 
+def write_progress_update(
+    progress_stream,
+    progress_every,
+    date,
+    index_record_count,
+    files_attempted,
+    files_loaded,
+    stats,
+    label_config,
+):
+    if progress_stream is None or not progress_every:
+        return
+    if files_attempted <= 0 or files_attempted % progress_every != 0:
+        return
+    payload = {
+        "event": "audit_pipeline_progress",
+        "date": date,
+        "index_records": index_record_count,
+        "files_attempted": files_attempted,
+        "files_loaded": files_loaded,
+        "accepted": stats.get("accepted", 0),
+        "rejected": stats.get("rejected", 0),
+        "reject_reasons": dict(sorted((stats.get("reject_reasons") or {}).items())),
+        "labeler": labeler_stats_public(label_config),
+    }
+    progress_stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
+    if hasattr(progress_stream, "flush"):
+        progress_stream.flush()
+
+
 def append_if_record(records, record):
     if record is not None:
         records.append(record)
@@ -1999,8 +2157,33 @@ def apply_optional_model_label(canonical, label_config, enable_route_labeler=Fal
         canonical["routing"]["model_label"] = normalized
 
 
-def apply_optional_quality_label(canonical, label_config, enable_quality_labeler=False, enable_label_snippets=False, max_chars=1200):
+def quality_label_skip_reason(canonical, config):
+    quality = canonical.get("quality") or {}
+    if quality.get("reject_reasons"):
+        return "deterministic_reject"
+    deterministic_score = quality.get("deterministic_quality_score") or 0.0
+    if deterministic_score < config.get("selected_min_score", 0.6):
+        return "below_selected_min_score"
+    if not quality.get("use_for"):
+        return "no_selected_use"
+    return None
+
+
+def apply_optional_quality_label(
+    canonical,
+    label_config,
+    enable_quality_labeler=False,
+    enable_label_snippets=False,
+    max_chars=1200,
+    selection_config=None,
+):
     if not enable_quality_labeler or not label_config.get("enabled"):
+        return
+    selection_config = selection_config or default_selection_config()
+    skip_reason = quality_label_skip_reason(canonical, selection_config)
+    if skip_reason is not None:
+        canonical.setdefault("quality", {})["model_quality_error"] = "skipped:%s" % skip_reason
+        record_labeler_stat(label_config, "skips", "score_quality:%s" % skip_reason)
         return
     payload, error = build_quality_label_payload(
         canonical,
@@ -3103,6 +3286,7 @@ def build_selection_manifest(
             "quality_enabled": bool(config.get("enable_quality_labeler")),
             "snippets_enabled": bool(config.get("enable_label_snippets")),
             "feature_only_default": not bool(config.get("enable_label_snippets")),
+            "stats": copy.deepcopy(config.get("labeler_stats") or init_labeler_stats()),
         },
         "k_threshold": config.get("k_threshold"),
     }
@@ -3293,8 +3477,15 @@ def process_date(
     max_dedupe_seen_hashes=None,
     max_dedupe_user_session_windows=None,
     max_near_duplicate_buckets=None,
+    progress_every=0,
+    progress_stream=None,
 ):
     validate_date_string(date)
+    progress_every = int(progress_every or 0)
+    if progress_every < 0:
+        raise ValueError("progress_every must be greater than or equal to 0")
+    if progress_every and progress_stream is None:
+        progress_stream = sys.stderr
     if selection_mode not in ("auto", "in-memory", "spool"):
         raise ValueError("selection_mode must be auto, in-memory, or spool")
     if compat_output_set:
@@ -3387,6 +3578,16 @@ def process_date(
                 update_stats_for_reject(stats, error)
                 if not dry_run:
                     write_reject(handles, date, error)
+                write_progress_update(
+                    progress_stream,
+                    progress_every,
+                    date,
+                    index_record_count,
+                    files_attempted,
+                    files_loaded,
+                    stats,
+                    label_config,
+                )
                 continue
             files_loaded += 1
             canonical, reject = build_canonical_sample(date, index_record, raw)
@@ -3394,6 +3595,16 @@ def process_date(
                 update_stats_for_reject(stats, reject)
                 if not dry_run:
                     write_reject(handles, date, reject)
+                write_progress_update(
+                    progress_stream,
+                    progress_every,
+                    date,
+                    index_record_count,
+                    files_attempted,
+                    files_loaded,
+                    stats,
+                    label_config,
+                )
                 continue
             apply_optional_model_label(
                 canonical,
@@ -3409,6 +3620,7 @@ def process_date(
                 enable_quality_labeler=enable_quality_labeler,
                 enable_label_snippets=enable_label_snippets,
                 max_chars=label_max_input_chars,
+                selection_config=config,
             )
             refresh_selection_use_for(canonical, config)
             update_stats_for_canonical(stats, canonical)
@@ -3429,6 +3641,16 @@ def process_date(
                 else:
                     annotated_records.append(canonical)
                     retained_bytes += estimate_record_size(canonical)
+            write_progress_update(
+                progress_stream,
+                progress_every,
+                date,
+                index_record_count,
+                files_attempted,
+                files_loaded,
+                stats,
+                label_config,
+            )
         if spool_handle is not None:
             spool_handle.close()
             spool_handle = None
@@ -3460,6 +3682,9 @@ def process_date(
                 user_task_stats = user_task_stats_from_state(report_state, k_threshold)
                 dedupe_rejected = dedupe_rejected_from_report_state(report_state)
         finished_at = datetime.datetime.utcnow().isoformat() + "Z"
+        labeler_summary = labeler_stats_public(label_config)
+        stats["labeler"] = labeler_summary
+        config["labeler_stats"] = labeler_summary
         manifest = {
             "date": date,
             "input_root": str(input_root),
@@ -3474,6 +3699,7 @@ def process_date(
             "started_at": started_at,
             "finished_at": finished_at,
             "dry_run": bool(dry_run),
+            "labeler": labeler_summary,
             "selection": {
                 "enabled": selection_enabled,
                 "mode_used": mode_used,
@@ -3625,6 +3851,7 @@ def parse_args(argv):
     parser.add_argument("--max-selected-per-task-fingerprint-per-day", type=non_negative_int, default=200)
     parser.add_argument("--max-high-value-per-task-fingerprint-per-day", type=non_negative_int, default=50)
     parser.add_argument("--label-max-input-chars", type=non_negative_int, default=1200)
+    parser.add_argument("--progress-every", type=non_negative_int, default=0)
     parser.add_argument("--max-in-memory-samples", type=non_negative_int, default=DEFAULT_MAX_IN_MEMORY_SAMPLES)
     parser.add_argument("--max-selection-memory-mb", type=non_negative_int, default=DEFAULT_MAX_SELECTION_MEMORY_MB)
     parser.add_argument("--selection-mode", choices=("auto", "in-memory", "spool"), default="auto")
@@ -3718,6 +3945,7 @@ def main(argv=None):
             max_dedupe_seen_hashes=args.max_dedupe_seen_hashes,
             max_dedupe_user_session_windows=args.max_dedupe_user_session_windows,
             max_near_duplicate_buckets=args.max_near_duplicate_buckets,
+            progress_every=args.progress_every,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
     return 0

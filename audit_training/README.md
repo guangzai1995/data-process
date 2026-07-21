@@ -29,6 +29,12 @@ Validation run without final outputs:
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --date 2026-07-15 --limit 100 --dry-run
 ```
 
+Progress logging for longer runs writes aggregate JSON lines to stderr and keeps stdout machine-readable:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --date 2026-07-15 --limit 100 --progress-every 25
+```
+
 Legacy-only compatibility run:
 
 ```bash
@@ -98,6 +104,8 @@ AUDIT_LABEL_BASE_URL
 AUDIT_LABEL_API_KEY
 AUDIT_LABEL_MODEL
 AUDIT_LABEL_TIMEOUT
+AUDIT_LABEL_CACHE
+AUDIT_LABEL_CACHE_MAX_ENTRIES
 AUDIT_SELECTION_HMAC_KEY
 ```
 
@@ -109,6 +117,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_training_pipeline.py --date 2026
 ```
 
 Labeler payloads are feature-only by default. Redacted snippets are sent only with `--enable-label-snippets`, and only after local leakage scanning passes. Positive model suggestions cannot override hard rejects, duplicate suppression, quotas, invalid tool traces, or deterministic threshold eligibility. Negative quality risk can downrank or remove selected eligibility.
+
+Model-assisted labeling uses an in-process payload-hash cache by default so repeated feature-only payloads do not trigger duplicate HTTP requests. Set `AUDIT_LABEL_CACHE=0` to disable it or `AUDIT_LABEL_CACHE_MAX_ENTRIES` to bound entries. Quality model calls are skipped for samples that deterministic local quality already rejects or cannot make selected-eligible; reports expose aggregate `requests`, `cache_hits`, `cache_stores`, `cache_evictions`, `skips`, and `errors` counters under `labeler`.
 
 ## Safety
 

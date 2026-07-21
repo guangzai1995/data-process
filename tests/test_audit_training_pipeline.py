@@ -59,6 +59,11 @@ class PipelineImportTest(unittest.TestCase):
             "tenant/user/session hashes",
             "internal dedupe hash fields",
             "AUDIT_SELECTION_HMAC_KEY",
+            "AUDIT_LABEL_CACHE",
+            "AUDIT_LABEL_CACHE_MAX_ENTRIES",
+            "--progress-every",
+            "cache_hits",
+            "skips",
         ]:
             self.assertIn(token, readme)
         self.assertIn("Environment variables alone do not trigger external calls", readme)
@@ -1279,10 +1284,14 @@ class LabelModelTest(unittest.TestCase):
             "AUDIT_LABEL_API_KEY": "key",
             "AUDIT_LABEL_MODEL": "label-model",
             "AUDIT_LABEL_TIMEOUT": "12",
+            "AUDIT_LABEL_CACHE_MAX_ENTRIES": "17",
         }
         config = pipeline.load_label_config(env)
         self.assertTrue(config["enabled"])
         self.assertEqual(config["timeout"], 12)
+        self.assertTrue(config["cache_enabled"])
+        self.assertEqual(config["cache_max_entries"], 17)
+        self.assertEqual(config["stats"], pipeline.init_labeler_stats())
         self.assertNotIn("max_concurrency", config)
 
     def test_label_config_disables_when_required_values_are_missing(self):
@@ -1312,6 +1321,16 @@ class LabelModelTest(unittest.TestCase):
 
         config = pipeline.load_label_config(dict(base_env, AUDIT_LABEL_TIMEOUT="bad"))
         self.assertEqual(config["timeout"], 30)
+
+    def test_label_config_can_disable_cache(self):
+        pipeline = load_pipeline_module()
+        config = pipeline.load_label_config({
+            "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+            "AUDIT_LABEL_API_KEY": "key",
+            "AUDIT_LABEL_MODEL": "label-model",
+            "AUDIT_LABEL_CACHE": "0",
+        })
+        self.assertFalse(config["cache_enabled"])
 
     def test_call_label_model_disabled_returns_reason(self):
         pipeline = load_pipeline_module()
@@ -1386,6 +1405,68 @@ class LabelModelTest(unittest.TestCase):
         self.assertEqual(parsed["label"], "tool_agent")
         self.assertEqual(parsed["confidence"], 0.91)
         self.assertEqual(calls[0][1], 12)
+
+    def test_call_label_model_uses_in_memory_cache_by_payload_hash(self):
+        pipeline = load_pipeline_module()
+        payload = {
+            "task": "classify_route",
+            "labels": ["tool_agent"],
+            "sample": {"features": {"has_tools": True, "message_count": 2}},
+            "response_format": {
+                "label": "string",
+                "confidence": "number",
+                "reason": "string",
+            },
+        }
+        calls = []
+
+        class FakeResponse(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"label":"tool_agent","confidence":0.91,"reason":"uses tools"}'
+                            }
+                        }
+                    ]
+                }).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            return FakeResponse()
+
+        config = {
+            "enabled": True,
+            "base_url": "https://example.test/v1",
+            "api_key": "key",
+            "model": "label-model",
+            "timeout": 12,
+            "cache_enabled": True,
+            "cache_max_entries": 10,
+            "cache": {},
+            "stats": pipeline.init_labeler_stats(),
+        }
+        first, first_error = pipeline.call_label_model(
+            payload, config, urlopen=fake_urlopen
+        )
+        second, second_error = pipeline.call_label_model(
+            copy.deepcopy(payload), config, urlopen=fake_urlopen
+        )
+
+        self.assertIsNone(first_error)
+        self.assertIsNone(second_error)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(config["stats"]["requests"], {"classify_route": 1})
+        self.assertEqual(config["stats"]["cache_hits"], {"classify_route": 1})
+        self.assertEqual(config["stats"]["cache_stores"], {"classify_route": 1})
 
     def test_call_label_model_rejects_invalid_response(self):
         pipeline = load_pipeline_module()
@@ -1518,6 +1599,7 @@ class SelectionPipelineTest(unittest.TestCase):
             "--max-dedupe-seen-hashes", "100",
             "--max-dedupe-user-session-windows", "20",
             "--max-near-duplicate-buckets", "30",
+            "--progress-every", "25",
         ])
         self.assertTrue(args.disable_episodes)
         self.assertEqual(args.selection_mode, "spool")
@@ -1539,6 +1621,7 @@ class SelectionPipelineTest(unittest.TestCase):
         self.assertEqual(args.max_dedupe_seen_hashes, 100)
         self.assertEqual(args.max_dedupe_user_session_windows, 20)
         self.assertEqual(args.max_near_duplicate_buckets, 30)
+        self.assertEqual(args.progress_every, 25)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 pipeline.parse_args(["--date", "2026-07-15", "--compat-output-set", "--enable-quality-labeler"])
@@ -3721,6 +3804,82 @@ class PipelineRunTest(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(old_env)
+
+    def test_process_date_skips_quality_labeler_for_deterministic_rejects(self):
+        pipeline = load_pipeline_module()
+        old_env = os.environ.copy()
+        original_urlopen = pipeline.urllib.request.urlopen
+
+        def forbidden_urlopen(request, timeout=None):
+            raise AssertionError("quality labeler should be skipped for deterministic rejects")
+
+        try:
+            os.environ.clear()
+            os.environ.update(old_env)
+            os.environ.update({
+                "AUDIT_LABEL_BASE_URL": "https://example.test/v1",
+                "AUDIT_LABEL_API_KEY": "key",
+                "AUDIT_LABEL_MODEL": "label-model",
+            })
+            pipeline.urllib.request.urlopen = forbidden_urlopen
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                input_root = root / "audit"
+                output_root = root / "out"
+                day = input_root / "2026-07-15"
+                write_json(day / "u" / "s" / "001.json", sample_success_record())
+                write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+
+                result = pipeline.process_date(
+                    str(input_root),
+                    str(output_root),
+                    "2026-07-15",
+                    enable_quality_labeler=True,
+                )
+
+                canonical = read_jsonl(output_root / "canonical" / "2026-07-15.jsonl")[0]
+                self.assertEqual(result["accepted"], 1)
+                self.assertIsNone(canonical["quality"].get("model_quality_score"))
+                self.assertEqual(
+                    result["labeler"]["skips"],
+                    {"score_quality:deterministic_reject": 1},
+                )
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_date_progress_logs_sanitized_aggregate_counts(self):
+        pipeline = load_pipeline_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            input_root = root / "audit"
+            output_root = root / "out"
+            day = input_root / "2026-07-15"
+            write_json(day / "u" / "s" / "001.json", sample_success_record())
+            write_index(day, [{"request_id": "request-1", "file_path": "2026-07-15/u/s/001.json"}])
+            progress = io.StringIO()
+
+            result = pipeline.process_date(
+                str(input_root),
+                str(output_root),
+                "2026-07-15",
+                progress_every=1,
+                progress_stream=progress,
+            )
+
+            lines = progress.getvalue().splitlines()
+            self.assertEqual(result["accepted"], 1)
+            self.assertGreaterEqual(len(lines), 1)
+            payload = json.loads(lines[0])
+            self.assertEqual(payload["event"], "audit_pipeline_progress")
+            self.assertEqual(payload["date"], "2026-07-15")
+            self.assertEqual(payload["files_attempted"], 1)
+            self.assertEqual(payload["accepted"], 1)
+            dumped = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("request-1", dumped)
+            self.assertNotIn("messages", dumped)
+            self.assertNotIn("13800138000", dumped)
 
     def test_process_date_dry_run_leaves_no_outputs_or_tmp(self):
         pipeline = load_pipeline_module()
